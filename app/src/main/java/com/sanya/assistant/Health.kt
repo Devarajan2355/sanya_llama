@@ -16,18 +16,6 @@ import java.io.File
 /**
  * Health: one place that checks whether Sanya is set up properly and says what to fix.
  * Used by the Health check screen and by the voice command "run a health check".
- *
- *   OK    working
- *   WARN  works, but something is limited or worth fixing
- *   BAD   something she needs is missing, so a feature will not work
- *   INFO  just information
- *
- * A check can carry a fix id that HealthActivity turns into a button:
- *   perm:<ANDROID PERMISSION>   ask for that permission
- *   overlay                     "Display over other apps" settings
- *   battery                     battery optimisation settings
- *   appsettings                 this app's settings page
- *   startscreen                 the start screen (download a voice, tap Start)
  */
 object Health {
 
@@ -393,7 +381,6 @@ object Health {
     }
 
     private fun online(ctx: Context): Boolean {
-
         return try {
             val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val caps = cm.getNetworkCapabilities(cm.activeNetwork)
