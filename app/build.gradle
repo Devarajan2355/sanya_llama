@@ -57,7 +57,7 @@ dependencies {
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47'
     // Piper TTS via sherpa-onnx (NaturalVoice.kt)
-    implementation 'com.github.k2-fsa:sherpa-onnx-android:1.10.22'
+    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")
     // ONNX Runtime pinned version (pulled by sherpa-onnx, pinned for stability)
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
 }
