@@ -34,7 +34,7 @@ target_include_directories(llama_android PRIVATE
 
 target_link_libraries(llama_android
     llama          # llama.cpp core
-    #common         # tokenizer helpers
+    common         # tokenizer helpers
     android        # Android NDK log
     log
 )
