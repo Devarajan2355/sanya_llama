@@ -1,11 +1,17 @@
 /**
  * llm_jni.cpp
  *
- * JNI bridge between LocalLLM.kt and llama.cpp (current API: vocab-based,
- * llama_model_load_from_file / llama_init_from_model / llama_memory_*).
- * Does NOT use llama.cpp's "common" library, so nothing else needs to be built.
+ * JNI bridge between LocalLLM.kt and llama.cpp.
  *
- * The resulting .so is  libllama_android.so  and is loaded by LocalLLM.kt.
+ * Build setup:
+ *   1. Add llama.cpp as a git submodule:
+ *        git submodule add https://github.com/ggml-org/llama.cpp \
+ *            app/src/main/cpp/llama.cpp
+ *   2. Place this file at  app/src/main/cpp/llm_jni.cpp
+ *   3. Place CMakeLists.txt at  app/src/main/cpp/CMakeLists.txt
+ *   4. Add the cmake block to app/build.gradle (see build.gradle patch file)
+ *
+ * The resulting .so is named  libllama_android.so  and is loaded by LocalLLM.kt.
  */
 
 #include <jni.h>
@@ -14,54 +20,40 @@
 #include <android/log.h>
 
 #include "llama.cpp/include/llama.h"
+#include "llama.cpp/common/common.h"
 
 #define TAG "SanyaLLM"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// We pack model + context into one heap object so we only need one jlong handle.
 struct LlamaHandle {
     llama_model   *model = nullptr;
     llama_context *ctx   = nullptr;
-    int            nCtx  = 2048;
 };
-
-// NewStringUTF aborts on invalid UTF-8 (a token can end mid-character), so drop bad bytes.
-static std::string sanitizeUtf8(const std::string &s) {
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        unsigned char c = (unsigned char) s[i];
-        size_t len = 0;
-        if (c < 0x80) len = 1;
-        else if ((c >> 5) == 0x6) len = 2;
-        else if ((c >> 4) == 0xE) len = 3;
-        else if ((c >> 3) == 0x1E) len = 4;
-        if (len == 0 || i + len > s.size()) { i++; continue; }
-        bool ok = true;
-        for (size_t k = 1; k < len; k++) {
-            if (((unsigned char) s[i + k] >> 6) != 0x2) { ok = false; break; }
-        }
-        if (ok) out.append(s, i, len);
-        i += ok ? len : 1;
-    }
-    return out;
-}
 
 extern "C" {
 
+// ------------------------------------------------------------------
+// nativeLoad
+// ------------------------------------------------------------------
 JNIEXPORT jlong JNICALL
 Java_com_sanya_assistant_LocalLLM_nativeLoad(
-    JNIEnv *env, jobject /* this */, jstring jPath, jint ctxSize, jint nThreads)
-{
+    JNIEnv *env,
+    jobject /* this */,
+    jstring jPath,
+    jint    ctxSize,
+    jint    nThreads
+) {
     const char *path = env->GetStringUTFChars(jPath, nullptr);
     LOGI("Loading model from: %s", path);
 
     llama_backend_init();
 
+    // ---- model ----
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;   // CPU only
-    llama_model *model = llama_model_load_from_file(path, mp);
+    mp.n_gpu_layers = 0;          // CPU only — works on every device
+    llama_model *model = llama_load_model_from_file(path, mp);
     env->ReleaseStringUTFChars(jPath, path);
 
     if (!model) {
@@ -69,63 +61,54 @@ Java_com_sanya_assistant_LocalLLM_nativeLoad(
         return 0L;
     }
 
+    // ---- context ----
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = (uint32_t) ctxSize;
-    cp.n_batch         = (uint32_t) ctxSize;
-    cp.n_threads       = nThreads;
-    cp.n_threads_batch = nThreads;
+    cp.n_ctx        = (uint32_t) ctxSize;
+    cp.n_threads    = (uint32_t) nThreads;
+    cp.n_threads_batch = (uint32_t) nThreads;
+    cp.flash_attn   = true;       // Faster on ARM where supported
+    llama_context *ctx = llama_new_context_with_model(model, cp);
 
-    llama_context *ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         LOGE("Failed to create context");
-        llama_model_free(model);
+        llama_free_model(model);
         return 0L;
     }
 
-    const llama_vocab *vocab = llama_model_get_vocab(model);
-    LOGI("Model loaded. Vocab: %d, Context: %d", llama_vocab_n_tokens(vocab), ctxSize);
+    LOGI("Model loaded. Vocab: %d, Context: %d", llama_n_vocab(model), ctxSize);
 
-    auto *h = new LlamaHandle();
-    h->model = model;
-    h->ctx   = ctx;
-    h->nCtx  = ctxSize;
+    auto *h = new LlamaHandle{model, ctx};
     return reinterpret_cast<jlong>(h);
 }
 
+// ------------------------------------------------------------------
+// nativeInfer
+// ------------------------------------------------------------------
 JNIEXPORT jstring JNICALL
 Java_com_sanya_assistant_LocalLLM_nativeInfer(
-    JNIEnv *env, jobject /* this */, jlong jHandle, jstring jPrompt, jint maxTokens, jfloat temp)
-{
+    JNIEnv *env,
+    jobject /* this */,
+    jlong   jHandle,
+    jstring jPrompt,
+    jint    maxTokens,
+    jfloat  temp
+) {
     auto *h = reinterpret_cast<LlamaHandle *>(jHandle);
-    if (!h || !h->model || !h->ctx) return env->NewStringUTF("");
+    if (!h || !h->model || !h->ctx) {
+        return env->NewStringUTF("");
+    }
 
     const char *promptCStr = env->GetStringUTFChars(jPrompt, nullptr);
     std::string prompt(promptCStr);
     env->ReleaseStringUTFChars(jPrompt, promptCStr);
 
-    const llama_vocab *vocab = llama_model_get_vocab(h->model);
+    // ---- tokenise ----
+    std::vector<llama_token> tokens = llama_tokenize(h->ctx, prompt, /*add_bos=*/true, /*special=*/true);
+    if (tokens.empty()) return env->NewStringUTF("");
 
-    // ---- tokenise (first call sizes the buffer) ----
-    int n = -llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
-                            nullptr, 0, /*add_special=*/true, /*parse_special=*/true);
-    if (n <= 0) return env->NewStringUTF("");
-
-    std::vector<llama_token> tokens(n);
-    if (llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
-                       tokens.data(), (int32_t) tokens.size(), true, true) < 0) {
-        LOGE("tokenize failed");
-        return env->NewStringUTF("");
-    }
-
-    // Keep room for the reply: if the prompt is too long, keep its tail.
-    int room = h->nCtx - (int) maxTokens - 1;
-    if (room < 16) room = 16;
-    if ((int) tokens.size() > room) {
-        tokens.erase(tokens.begin(), tokens.end() - room);
-    }
-
-    // Every call is independent: clear the KV cache (history lives in the Kotlin prompt).
-    llama_memory_clear(llama_get_memory(h->ctx), true);
+    // Clear KV cache so every call is independent (stateless on the C++ side;
+    // conversation history is managed in Kotlin via the prompt string itself).
+    llama_kv_cache_clear(h->ctx);
 
     // ---- evaluate prompt ----
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
@@ -135,32 +118,37 @@ Java_com_sanya_assistant_LocalLLM_nativeInfer(
     }
 
     // ---- sampler chain ----
-    llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    // Pass vocab size as first argument to match llama.h signature
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
-        /*n_vocab=*/llama_vocab_n_tokens(vocab),
-        /*penalty_last_n=*/64, /*penalty_repeat=*/1.15f, /*penalty_freq=*/0.0f, /*penalty_present=*/0.0f));
+    auto sparams = llama_sampler_chain_default_params();
+    llama_sampler *sampler = llama_sampler_chain_init(sparams);
+    // Repetition penalty — reduces loops common in small models
+    llama_sampler_chain_add(sampler,
+        llama_sampler_init_penalties(
+            llama_n_vocab(h->model),
+            llama_token_eos(h->model),
+            llama_token_nl(h->model),
+            64,     // last_n
+            1.15f,  // repeat penalty
+            0.0f,   // freq penalty
+            0.0f    // presence penalty
+        )
+    );
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(/*seed=*/42));
 
     // ---- generate ----
     std::string result;
     result.reserve(512);
+    char piece[16];
 
     for (int i = 0; i < maxTokens; i++) {
-        llama_token token = llama_sampler_sample(sampler, h->ctx, -1);
+        llama_token token = llama_sampler_sample(sampler, h->ctx, /*idx=*/-1);
 
-        if (llama_vocab_is_eog(vocab, token)) break;
+        if (llama_token_is_eog(h->model, token)) break;
 
-        std::string piece(32, '\0');
-        int len = llama_token_to_piece(vocab, token, &piece[0], (int32_t) piece.size(), 0, false);
-        if (len < 0) {
-            piece.assign((size_t) -len, '\0');
-            len = llama_token_to_piece(vocab, token, &piece[0], (int32_t) piece.size(), 0, false);
-        }
-        if (len > 0) result.append(piece, 0, (size_t) len);
+        int n = llama_token_to_piece(h->model, token, piece, sizeof(piece), /*lstrip=*/0, /*special=*/false);
+        if (n > 0) result.append(piece, n);
 
         llama_batch next = llama_batch_get_one(&token, 1);
         if (llama_decode(h->ctx, next) != 0) break;
@@ -169,17 +157,23 @@ Java_com_sanya_assistant_LocalLLM_nativeInfer(
     llama_sampler_free(sampler);
 
     LOGI("Generated %zu chars", result.size());
-    return env->NewStringUTF(sanitizeUtf8(result).c_str());
+    return env->NewStringUTF(result.c_str());
 }
 
+// ------------------------------------------------------------------
+// nativeFree
+// ------------------------------------------------------------------
 JNIEXPORT void JNICALL
-Java_com_sanya_assistant_LocalLLM_nativeFree(JNIEnv * /*env*/, jobject /* this */, jlong jHandle)
-{
+Java_com_sanya_assistant_LocalLLM_nativeFree(
+    JNIEnv *env,
+    jobject /* this */,
+    jlong jHandle
+) {
     auto *h = reinterpret_cast<LlamaHandle *>(jHandle);
     if (!h) return;
     LOGI("Freeing LLM");
     if (h->ctx)   llama_free(h->ctx);
-    if (h->model) llama_model_free(h->model);
+    if (h->model) llama_free_model(h->model);
     llama_backend_free();
     delete h;
 }
