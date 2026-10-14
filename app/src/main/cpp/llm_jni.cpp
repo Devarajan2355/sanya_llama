@@ -136,7 +136,9 @@ Java_com_sanya_assistant_LocalLLM_nativeInfer(
 
     // ---- sampler chain ----
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    // Pass vocab size as first argument to match llama.h signature
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+        /*n_vocab=*/llama_vocab_n_tokens(vocab),
         /*penalty_last_n=*/64, /*penalty_repeat=*/1.15f, /*penalty_freq=*/0.0f, /*penalty_present=*/0.0f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
