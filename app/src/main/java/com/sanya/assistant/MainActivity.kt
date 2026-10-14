@@ -49,7 +49,7 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         }
-        status = TextView(this).apply { textSize = 14f; setPadding(0, pad / 2, 0, pad / 2) }
+        status = TextView(this).apply { textSize = 14f; setPadding(0, pad / 2, pad / 2, pad / 2) }
         dl = wide("Download offline voice (about 40 MB)") { download() }
         val start = wide("Start Sanya") { go() }.apply { textSize = 20f }
         val row = LinearLayout(this).apply {
@@ -66,15 +66,16 @@ class MainActivity : Activity() {
             addView(dl)
             addView(wide("Choose voice: US / Indian English") { switchVoice() })
             addView(wide("Hearing: offline / Google (better for Indian names)") { switchHearing() })
+            // ---- AI brain downloads ----
+            addView(wide("Download AI brain — reasoning, explanation, translation (~200 MB)") { downloadLLM() })
+            addView(wide("Download offline knowledge base — Wikipedia facts (~100 MB)") { downloadKnowledge() })
+            addView(wide("Download natural voice — Piper TTS, sounds more human (~60 MB)") { downloadVoice() })
             addView(wide("Health check (what is wrong, and how to fix it)") { openScreen(HealthActivity::class.java, "HealthActivity") })
             addView(wide("My routines (chart and checklist)") { openScreen(RoutineActivity::class.java, "RoutineActivity") })
             addView(wide("My money (spent, earned, budget)") { openScreen(MoneyActivity::class.java, "MoneyActivity") })
             addView(wide("Study time (timer and log)") { openScreen(TimeActivity::class.java, "TimeActivity") })
             addView(wide("Edit rules (organised: nicknames, slang, facts...)") { openScreen(BrainActivity::class.java, "BrainActivity") })
             addView(wide("Keep Sanya alive (Xiaomi settings)") { keepAlive() })
-            addView(wide("Download AI brain — reasoning, explanation, translation (~200 MB)") { downloadLLM() })
-            addView(wide("Download offline knowledge base — Wikipedia facts (~100 MB)") { downloadKnowledge() })
-            addView(wide("Download natural voice — Piper TTS, sounds more human (~60 MB)") { downloadVoice() })
             addView(editor)
         })
         refreshModel()
@@ -99,14 +100,14 @@ class MainActivity : Activity() {
         dl.text = "Download ${ModelStore.label(url)} voice (about 40 MB)"
         dl.visibility = if (ok) View.GONE else View.VISIBLE
 
-        // ---- LLM / knowledge / natural voice status ----
-        val llmReady = LocalLLM.isInstalled(this)
-        val wikiReady = OfflineKnowledge.isInstalled(this)
+        // ---- AI brain status ----
+        val llmReady   = LocalLLM.isInstalled(this)
+        val wikiReady  = OfflineKnowledge.isInstalled(this)
         val piperReady = NaturalVoice.isInstalled(this)
 
         val extras = buildString {
-            if (!llmReady) append("\n• AI brain not downloaded yet (adds reasoning, translation, explanation).")
-            if (!wikiReady) append("\n• Offline knowledge base not downloaded yet (adds Wikipedia facts offline).")
+            if (!llmReady)   append("\n• AI brain not downloaded yet (adds reasoning, translation, explanation).")
+            if (!wikiReady)  append("\n• Offline knowledge base not downloaded yet (adds Wikipedia facts offline).")
             if (!piperReady) append("\n• Natural voice not downloaded yet (sounds more human).")
         }
         if (extras.isNotEmpty()) {
@@ -121,19 +122,16 @@ class MainActivity : Activity() {
         }
     }
 
-    // Screens that exist in the code but are not declared in AndroidManifest.xml cannot open.
     private fun missingScreens(): List<String> {
-
         val out = ArrayList<String>()
-
         val screens = listOf<Pair<Class<*>, String>>(
+            Pair(MainActivity::class.java, "MainActivity"),
             Pair(BrainActivity::class.java, "BrainActivity"),
             Pair(RoutineActivity::class.java, "RoutineActivity"),
             Pair(HealthActivity::class.java, "HealthActivity"),
             Pair(MoneyActivity::class.java, "MoneyActivity"),
             Pair(TimeActivity::class.java, "TimeActivity")
         )
-
         for (s in screens) {
             try {
                 packageManager.getActivityInfo(ComponentName(this, s.first), 0)
@@ -141,7 +139,6 @@ class MainActivity : Activity() {
                 out.add(s.second)
             }
         }
-
         return out
     }
 
@@ -153,6 +150,10 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Voice model download
+    // ---------------------------------------------------------------
+
     private fun download() {
         saveNow()
         dl.isEnabled = false
@@ -161,13 +162,16 @@ class MainActivity : Activity() {
             runOnUiThread {
                 dl.isEnabled = true
                 if (err == null) {
-                    // The running service still holds the old model in memory; restart it on the next Start.
                     stopService(Intent(this, BubbleService::class.java))
                     refreshModel()
                 } else status.text = "Download failed: $err"
             }
         }.start()
     }
+
+    // ---------------------------------------------------------------
+    // AI brain download (~200 MB)
+    // ---------------------------------------------------------------
 
     private fun downloadLLM() {
         if (LocalLLM.isInstalled(this)) { toast("AI brain already installed"); return }
@@ -178,9 +182,8 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (err == null) {
-                    status.text = "AI brain downloaded. Tap Start Sanya."
-                    // Reload the running service so it picks up the new model.
                     stopService(Intent(this, BubbleService::class.java))
+                    status.text = "AI brain downloaded. Tap Start Sanya."
                     refreshModel()
                 } else {
                     status.text = "AI brain download failed: $err"
@@ -188,6 +191,10 @@ class MainActivity : Activity() {
             }
         }.start()
     }
+
+    // ---------------------------------------------------------------
+    // Offline knowledge base download (~100 MB)
+    // ---------------------------------------------------------------
 
     private fun downloadKnowledge() {
         if (OfflineKnowledge.isInstalled(this)) { toast("Knowledge base already installed"); return }
@@ -198,7 +205,6 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (err == null) {
-                    // Open the DB immediately so the running service can use it.
                     OfflineKnowledge.open(this)
                     status.text = "Knowledge base ready."
                     refreshModel()
@@ -208,6 +214,10 @@ class MainActivity : Activity() {
             }
         }.start()
     }
+
+    // ---------------------------------------------------------------
+    // Natural voice (Piper TTS) download (~60 MB)
+    // ---------------------------------------------------------------
 
     private fun downloadVoice() {
         if (NaturalVoice.isInstalled(this)) { toast("Natural voice already installed"); return }
@@ -228,8 +238,10 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // Flips the "voice model url" line between the US and Indian English voices.
-    // A voice that is already downloaded switches instantly (no re-download).
+    // ---------------------------------------------------------------
+    // Voice model switching and hearing
+    // ---------------------------------------------------------------
+
     private fun switchVoice() {
         saveNow()
         val next = if (ModelStore.currentUrl() == ModelStore.INDIAN_URL) ModelStore.DEFAULT_URL else ModelStore.INDIAN_URL
@@ -238,7 +250,6 @@ class MainActivity : Activity() {
         editor.setText(loaded)
         refreshModel()
         if (ModelStore.isInstalled(this, next)) {
-            // Restart the service so the next Start loads this voice.
             stopService(Intent(this, BubbleService::class.java))
             toast("Switched to ${ModelStore.label(next)}. Tap Start Sanya.")
         } else {
@@ -246,8 +257,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Flips "setting | hearing" between my own offline ears and Google's recogniser.
-    // Tap Start Sanya afterwards so she picks it up.
     private fun switchHearing() {
         saveNow()
         val google = Brain.setting("hearing", "offline") == "google"
@@ -292,7 +301,6 @@ class MainActivity : Activity() {
     private fun go() {
         saveNow()
         if (!Settings.canDrawOverlays(this)) {
-            // Turn on "Display over other apps" for Sanya, then come back and tap Start again
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             return
         }
