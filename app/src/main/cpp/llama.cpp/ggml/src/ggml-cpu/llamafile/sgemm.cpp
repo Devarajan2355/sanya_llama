@@ -297,7 +297,8 @@ inline float hsum(vfloat32m8_t x) {
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// VECTORIZED MEMORY LOADING
+
+ // VECTORIZED MEMORY LOADING
 
 template <typename T, typename U> T load(const U *);
 
@@ -305,15 +306,25 @@ template <typename T, typename U> T load(const U *);
 template <> inline float32x4_t load(const float *p) {
     return vld1q_f32(p);
 }
-#if !defined(_MSC_VER)
-// FIXME: this should check for __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+#if !defined(_MSC_VER) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 template <> inline float16x8_t load(const ggml_fp16_t *p) {
     return vld1q_f16((const float16_t *)p);
 }
+
 template <> inline float32x4_t load(const ggml_fp16_t *p) {
     return vcvt_f32_f16(vld1_f16((const float16_t *)p));
 }
-#endif // _MSC_VER
+#elif !defined(_MSC_VER)
+template <> inline float32x4_t load(const ggml_fp16_t *p) {
+    float tmp[4];
+    for (int i = 0; i < 4; ++i) {
+        tmp[i] = GGML_CPU_FP16_TO_FP32(p[i]);
+    }
+    return vld1q_f32(tmp);
+}
+#endif // FP16 vector arithmetic
+
 #endif // __ARM_NEON
 
 #if defined(__VXE__) || defined(__VXE2__)
