@@ -1,262 +1,214 @@
-package com.sanya.assistant
+#!/usr/bin/env python3
+"""
+build_knowledge_db.py
+~~~~~~~~~~~~~~~~~~~~~
+Builds sanya-wiki-v1.db — the offline knowledge base used by OfflineKnowledge.kt.
 
-import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioTrack
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
+Source: Simple English Wikipedia dump (~200 MB XML, expands to ~700 MB)
+Output: sanya-wiki-v1.db (~100 MB SQLite with FTS5 index)
 
-/**
- * NaturalVoice: Piper neural TTS via the sherpa-onnx Android AAR.
- *
- * Piper sounds vastly more natural than Android's built-in TTS engine.
- * It runs fully offline, produces audio in ~200 ms on mid-range phones,
- * and uses ~60 MB for one voice model.
- *
- * Dependency (add to app/build.gradle):
- *   implementation 'com.github.k2-fsa:sherpa-onnx-android:1.10.22'
- *   // Maven repo: https://jitpack.io
- *
- * Voice model (downloaded once, ~60 MB):
- *   en_US-lessac-medium.onnx   — clear US-accented English
- *   en_US-lessac-medium.onnx.json  — config file alongside the model
- *
- * Alternate voices (swap the URL pair):
- *   en_IN-southern_english_female-low.onnx  ~28 MB  Indian accent
- *   en_GB-cori-medium.onnx                  ~63 MB  British English
- *
- * Usage:
- *   NaturalVoice.init(ctx)           // call once from a background thread
- *   NaturalVoice.speak("Hello")      // blocking — call from background thread
- *   NaturalVoice.stop()              // interrupt current speech
- *   NaturalVoice.isReady             // false until init() finishes
- *
- * BubbleService uses this when isReady == true, falls back to Android TTS otherwise.
- */
-object NaturalVoice {
+Requirements:
+    pip install mwxml mwparserfromhell tqdm
 
-    // ---- model URLs (two files required by Piper / sherpa-onnx) ----
-    private const val MODEL_URL =
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/" +
-        "en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-    private const val CONFIG_URL =
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/" +
-        "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+Usage:
+    # 1. Download the dump (run once — ~220 MB)
+    curl -L -o simplewiki.xml.bz2 \
+      https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2
 
-    private const val MODEL_FILE  = "piper-voice.onnx"
-    private const val CONFIG_FILE = "piper-voice.onnx.json"
+    # 2. Build the database (takes ~5 minutes)
+    python3 build_knowledge_db.py simplewiki.xml.bz2 sanya-wiki-v1.db
 
-    private const val SAMPLE_RATE = 22050   // Piper outputs 22 050 Hz mono PCM16
+    # 3. Host sanya-wiki-v1.db on your CDN and update DB_URL in OfflineKnowledge.kt
+"""
 
-    @Volatile private var tts: Any?  = null   // k2fsa.sherpa_onnx.OfflineTts (reflection)
-    @Volatile private var playing    = false
-    @Volatile private var track: AudioTrack? = null
+import bz2
+import re
+import sqlite3
+import sys
+from pathlib import Path
 
-    val isReady get() = tts != null
+try:
+    import mwxml
+    import mwparserfromhell
+    from tqdm import tqdm
+except ImportError:
+    sys.exit("Run: pip install mwxml mwparserfromhell tqdm")
 
-    // ---------------------------------------------------------------
-    // Installation
-    // ---------------------------------------------------------------
 
-    fun modelFile(ctx:  Context) = File(ctx.filesDir, MODEL_FILE)
-    fun configFile(ctx: Context) = File(ctx.filesDir, CONFIG_FILE)
+# -----------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------
 
-    fun isInstalled(ctx: Context) =
-        modelFile(ctx).exists()  && modelFile(ctx).length()  > 1_000_000L &&
-        configFile(ctx).exists() && configFile(ctx).length() > 100L
+MAX_SUMMARY_CHARS = 600   # first ~3 sentences per article
+MAX_ARTICLES      = 250_000
+MIN_SUMMARY_CHARS = 80    # skip stubs shorter than this
 
-    /** Download both model files. Returns null on success. */
-    fun download(ctx: Context, onProgress: (Int) -> Unit): String? {
-        val files = listOf(MODEL_URL to MODEL_FILE, CONFIG_URL to CONFIG_FILE)
-        for ((url, name) in files) {
-            val err = downloadFile(ctx, url, name) { p ->
-                // Model is ~60 MB, config is tiny — report model progress as 0-95, config as 95-100
-                val adj = if (name == MODEL_FILE) (p * 95) / 100 else 95 + (p * 5) / 100
-                onProgress(adj)
-            }
-            if (err != null) return err
-        }
-        onProgress(100)
-        return null
-    }
+SKIP_TITLE_PREFIXES = (
+    "Wikipedia:", "Category:", "Template:", "Help:", "File:",
+    "Portal:", "Draft:", "User:", "Talk:", "Module:",
+)
 
-    private fun downloadFile(
-        ctx:        Context,
-        url:        String,
-        filename:   String,
-        onProgress: (Int) -> Unit
-    ): String? {
-        return try {
-            val tmp  = File(ctx.cacheDir, "$filename.tmp")
-            val conn = URL(url).openConnection() as HttpURLConnection
-            conn.connectTimeout = 20_000
-            conn.readTimeout    = 60_000
-            val total = conn.contentLengthLong
-            conn.inputStream.use { inp ->
-                tmp.outputStream().use { out ->
-                    val buf  = ByteArray(65_536)
-                    var done = 0L; var last = -1
-                    while (true) {
-                        val n = inp.read(buf); if (n < 0) break
-                        out.write(buf, 0, n); done += n
-                        if (total > 0) {
-                            val p = (done * 100 / total).toInt()
-                            if (p != last) { last = p; onProgress(p) }
-                        }
-                    }
-                }
-            }
-            val dest = File(ctx.filesDir, filename)
-            if (tmp.renameTo(dest)) null else "Could not install $filename"
-        } catch (e: Exception) { e.message ?: "Download failed: $filename" }
-    }
 
-    // ---------------------------------------------------------------
-    // Lifecycle  (call from a background thread)
-    // ---------------------------------------------------------------
+# -----------------------------------------------------------------------
+# Text helpers
+# -----------------------------------------------------------------------
 
-    /**
-     * Initialise the Piper TTS engine.
-     * Uses reflection so the code compiles even if the sherpa-onnx AAR
-     * is not yet added — isReady will just stay false.
-     */
-    fun init(ctx: Context): Boolean {
-        if (tts != null) return true
-        if (!isInstalled(ctx)) return false
-        return try {
-            // Equivalent to:
-            //   val config = OfflineTtsConfig(
-            //       model = OfflineTtsModelConfig(
-            //           vits = OfflineTtsVitsModelConfig(
-            //               model  = modelFile(ctx).absolutePath,
-            //               lexicon = "",
-            //               tokens = configFile(ctx).absolutePath
-            //           )
-            //       )
-            //   )
-            //   tts = OfflineTts(ctx, config)
-            //
-            // We use reflection so the app still builds without the AAR
-            // and NaturalVoice.isReady simply returns false.
+def extract_summary(wikitext: str) -> str:
+    """Return the first 1-3 clean sentences from a wikitext string."""
+    try:
+        parsed = mwparserfromhell.parse(wikitext)
+        text   = parsed.strip_code()
+    except Exception:
+        text = re.sub(r"\{\{[^}]*\}\}", "", wikitext)
+        text = re.sub(r"\[\[([^|\]]*\|)?([^\]]*)\]\]", r"\2", text)
+        text = re.sub(r"<[^>]+>", "", text)
 
-            val vitsClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig")
-            val vitsConfig = vitsClass.getConstructor(String::class.java, String::class.java, String::class.java)
-                .newInstance(modelFile(ctx).absolutePath, "", configFile(ctx).absolutePath)
+    # Collapse whitespace
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    text = re.sub(r" {2,}", " ", text)
 
-            val modelCfgClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsModelConfig")
-            val modelCfg = modelCfgClass.getConstructor(vitsClass)
-                .newInstance(vitsConfig)
+    # Take sentences up to MAX_SUMMARY_CHARS
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    summary   = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(summary) + len(s) > MAX_SUMMARY_CHARS:
+            break
+        summary += (" " if summary else "") + s
 
-            val cfgClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsConfig")
-            val cfg = cfgClass.getConstructor(modelCfgClass)
-                .newInstance(modelCfg)
+    return summary.strip()
 
-            val ttsClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTts")
-            tts = ttsClass.getConstructor(Context::class.java, cfgClass)
-                .newInstance(ctx, cfg)
 
-            true
-        } catch (e: Throwable) {
-            false
-        }
-    }
+def extract_categories(wikitext: str) -> str:
+    """Return pipe-separated category names."""
+    cats = re.findall(r"\[\[Category:([^\]|]+)", wikitext, re.IGNORECASE)
+    return "|".join(c.strip() for c in cats[:10])
 
-    fun release() {
-        stop()
-        runCatching { tts?.javaClass?.getMethod("release")?.invoke(tts) }
-        tts = null
-    }
 
-    // ---------------------------------------------------------------
-    // Speaking  (call from a background thread — blocks until done)
-    // ---------------------------------------------------------------
+# -----------------------------------------------------------------------
+# Database
+# -----------------------------------------------------------------------
 
-    /**
-     * Synthesise [text] and play it immediately.
-     * Returns when the audio is finished (or stopped).
-     */
-    fun speak(text: String) {
-        val engine = tts ?: return
-        if (text.isBlank()) return
-
-        stop()  // interrupt anything playing
-
-        try {
-            // Call OfflineTts.generate(text, speed, sid) → GeneratedAudio
-            val genMethod = engine.javaClass.getMethod(
-                "generate", String::class.java, Float::class.java, Int::class.java
-            )
-            val audio = genMethod.invoke(engine, text, 1.0f, 0) ?: return
-
-            // GeneratedAudio has a .samples: FloatArray and .sampleRate: Int
-            val samplesField = audio.javaClass.getField("samples")
-            val samples = samplesField.get(audio) as? FloatArray ?: return
-
-            playPcmFloat(samples)
-        } catch (e: Throwable) {
-            // Silently fall back to Android TTS (handled by BubbleService)
-        }
-    }
-
-    /** Interrupt any ongoing speech immediately. */
-    fun stop() {
-        playing = false
-        runCatching { track?.stop(); track?.release() }
-        track = null
-    }
-
-    // ---------------------------------------------------------------
-    // PCM playback
-    // ---------------------------------------------------------------
-
-    private fun playPcmFloat(samples: FloatArray) {
-        if (samples.isEmpty()) return
-
-        val minBuf = AudioTrack.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT
+def create_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA page_size=4096")
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS articles USING fts5(
+            title,
+            summary,
+            categories,
+            tokenize = 'porter unicode61'
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+    return conn
 
-        val at = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                    .build()
-            )
-            .setBufferSizeInBytes(maxOf(minBuf, samples.size * 4))
-            .setTransferMode(AudioTrack.MODE_STATIC)
-            .build()
 
-        track   = at
-        playing = true
+def insert_batch(conn: sqlite3.Connection, rows: list) -> None:
+    conn.executemany(
+        "INSERT INTO articles(title, summary, categories) VALUES (?, ?, ?)",
+        rows
+    )
+    conn.commit()
 
-        at.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-        at.play()
 
-        // Wait for playback to finish or be stopped.
-        val durationMs = (samples.size.toLong() * 1000L) / SAMPLE_RATE
-        val deadline   = System.currentTimeMillis() + durationMs + 500L
+# -----------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------
 
-        while (playing && at.playState == AudioTrack.PLAYSTATE_PLAYING
-               && System.currentTimeMillis() < deadline) {
-            Thread.sleep(50)
-        }
+def main(dump_path: str, db_path: str) -> None:
+    print(f"Source: {dump_path}")
+    print(f"Output: {db_path}")
 
-        at.stop()
-        at.release()
-        if (track === at) track = null
-        playing = false
-    }
-}
+    if Path(db_path).exists():
+        Path(db_path).unlink()
+
+    conn  = create_db(db_path)
+    batch = []
+    total = 0
+    skipped = 0
+
+    opener = bz2.open if dump_path.endswith(".bz2") else open
+
+    with opener(dump_path, "rb") as f:
+        dump = mwxml.Dump.from_file(f)
+
+        try:
+            bar = tqdm(total=MAX_ARTICLES, unit="articles")
+        except Exception:
+            bar = None
+
+        for page in dump.pages:
+            if total >= MAX_ARTICLES:
+                break
+
+            title = page.title or ""
+
+            if any(title.startswith(p) for p in SKIP_TITLE_PREFIXES):
+                continue
+
+            if page.namespace != 0:   # 0 = main articles
+                continue
+
+            rev = next(iter(page), None)
+            if not rev or not rev.text:
+                skipped += 1
+                continue
+
+            summary    = extract_summary(rev.text)
+            categories = extract_categories(rev.text)
+
+            if len(summary) < MIN_SUMMARY_CHARS:
+                skipped += 1
+                continue
+
+            batch.append((title, summary, categories))
+            total += 1
+
+            if bar:
+                bar.update(1)
+                bar.set_postfix(skipped=skipped)
+
+            if len(batch) >= 2000:
+                insert_batch(conn, batch)
+                batch.clear()
+
+        if batch:
+            insert_batch(conn, batch)
+
+        if bar:
+            bar.close()
+
+    # ---- metadata ----
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('article_count', ?)", (str(total),))
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('source', 'Simple English Wikipedia')")
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('build_version', '1')")
+    conn.commit()
+
+    # ---- optimise ----
+    print("Optimising FTS index…")
+    conn.execute("INSERT INTO articles(articles) VALUES('optimize')")
+    conn.execute("VACUUM")
+    conn.commit()
+    conn.close()
+
+    size_mb = Path(db_path).stat().st_size / 1_048_576
+    print(f"\nDone. {total:,} articles, {skipped:,} skipped.")
+    print(f"Database size: {size_mb:.1f} MB → {db_path}")
+    print("\nNext step: host the .db file and update DB_URL in OfflineKnowledge.kt")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit(f"Usage: python3 {sys.argv[0]} <dump.xml.bz2> <output.db>")
+    main(sys.argv[1], sys.argv[2])
