@@ -43,17 +43,14 @@ class BubbleService : Service() {
     private val muted = mutableListOf<Int>()
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var sr: SpeechRecognizer? = null        // Google voice (backup)
-    private var ears: Ears? = null                  // offline Vosk voice
+    private var sr: SpeechRecognizer? = null
+    private var ears: Ears? = null
     private var voskReady = false
-    private var hearingMode = ""                   // "google" or "offline", as last applied
+    private var hearingMode = ""
 
-    // Which ears are in charge. "setting | hearing = google" makes Google's recogniser
-    // do all the listening (much better with Indian names and accents).
     private fun googleHearing() = Brain.setting("hearing", "offline") == "google"
     private fun offlineEars() = voskReady && !googleHearing()
 
-    // Called after any command, and on Start: switch the ears if the setting changed.
     private fun applyHearing() {
         val now = if (googleHearing()) "google" else "offline"
         if (now == hearingMode) return
@@ -61,19 +58,20 @@ class BubbleService : Service() {
         if (now == "google") {
             ears?.stop()
             releaseLock()
-            if (handsFree) ui.postDelayed({ resume() }, 2500)    // after she says "Okay…"
+            if (handsFree) ui.postDelayed({ resume() }, 2500)
         } else {
             sr?.destroy(); sr = null; listening = false; unmuteBeep()
             if (handsFree && voskReady) { takeLock(); ears?.paused = false; ears?.start() }
         }
     }
+
     private var loading = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var pulse: ObjectAnimator? = null
-    private var handsFree = false   // always listening for "Sanya" (long-press the bubble)
-    private var awaiting = false    // the next sentence is a command, no wake word needed
-    private var listening = false   // Google voice is active
-    private var pending = 0         // spoken sentences still queued
+    private var handsFree = false
+    private var awaiting = false
+    private var listening = false
+    private var pending = 0
     private var size = 0
     private var wakeRx = Regex("sanya")
     private val hideCaption = Runnable { caption.visibility = View.GONE }
@@ -87,9 +85,6 @@ class BubbleService : Service() {
         const val IDLE = 0xFF6C5CE7.toInt()
         const val LISTENING = 0xFF00B894.toInt()
         const val HANDS_FREE = 0xFFE17055.toInt()
-
-        // True while the service is running, so a pomodoro alarm knows it can ask her to speak.
-        @Volatile var alive = false
     }
 
     override fun onBind(i: Intent?): IBinder? = null
@@ -101,13 +96,14 @@ class BubbleService : Service() {
     override fun onCreate() {
         ErrorLog.install(this)
         super.onCreate()
-        alive = true
         Brain.setup(this)
         wakeRx = wake()
         hearingMode = if (googleHearing()) "google" else "offline"
         getSystemService(NotificationManager::class.java)
             .createNotificationChannel(NotificationChannel("sanya", "Sanya", NotificationManager.IMPORTANCE_MIN))
         startForeground(1, notif())
+
+        // ---- Android TTS (fallback when Piper is not ready) ----
         tts = TextToSpeech(this) {
             if (it == TextToSpeech.SUCCESS) {
                 ttsReady = true
@@ -121,15 +117,8 @@ class BubbleService : Service() {
             }
         }
 
-        // Boot Piper TTS on a background thread.
-        Thread {
-            if (NaturalVoice.isInstalled(this)) {
-                val ok = NaturalVoice.init(this)
-                if (ok) ui.post { show("Natural voice ready") }
-            }
-        }.also { it.isDaemon = true }.start()
-
         runner = StepRunner(this, { say(it) }, { show(it, 8000L) })
+
         ears = Ears(this,
             onPartial = { p -> ui.post { if (awaiting || wakeRx.containsMatchIn(p)) show("🎤 $p") } },
             onFinal = { t -> ui.post { heard(listOf(t)) } },
@@ -137,13 +126,33 @@ class BubbleService : Service() {
                 ErrorLog.note(this, "Hearing", m)
                 ui.post { stopEars(m) }
             })
+
         showBubble()
         makeCaption()
         loadEars()
+
+        // ---- Boot Piper TTS in the background ----
+        Thread {
+            if (NaturalVoice.isInstalled(this)) {
+                val ok = NaturalVoice.init(this)
+                if (ok) ui.post { show("Natural voice ready") }
+            }
+        }.also { it.isDaemon = true }.start()
+
+        // ---- Boot LocalLLM and OfflineKnowledge in the background ----
+        Thread {
+            if (LocalLLM.isInstalled(this) && !LocalLLM.isReady) {
+                LocalLLM.load(this)
+            }
+            if (OfflineKnowledge.isInstalled(this) && !OfflineKnowledge.isOpen) {
+                OfflineKnowledge.open(this)
+            }
+        }.also { it.isDaemon = true }.start()
+
         ui.postDelayed(tick, 45_000L)
     }
 
-    // ---------- Proactive Sanya: speaks first when something matters ----------
+    // ---------- Proactive Sanya ----------
     private val tick = object : Runnable {
         override fun run() {
             try { proactiveCheck() } catch (e: Throwable) { ErrorLog.add(this@BubbleService, "Proactive check", e) }
@@ -152,29 +161,22 @@ class BubbleService : Service() {
         }
     }
 
-    // The home-screen widget ticks its own clock, but routines you mark by voice and
-    // pomodoro phase changes need a redraw. Only while the screen is on, to save battery.
     private fun keepWidgetFresh() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (pm.isInteractive) SanyaWidget.refresh(this)
     }
 
     private fun proactiveCheck() {
-        // Never interrupt: not while she is talking or listening, not on a call.
         if (pending > 0 || listening || awaiting || runner.wantsReply()) return
         if (am.mode == AudioManager.MODE_IN_CALL || am.mode == AudioManager.MODE_IN_COMMUNICATION) return
 
-        // A pomodoro cue is something you asked for, so it is spoken even with the screen off
-        // or music playing (you study with the phone down). It also logs finished focus sessions.
         val cue = Pomodoro.due(this)
         if (cue != null) {
             say(cue)
-            Pomodoro.notify(this, cue)
             SanyaWidget.refresh(this)
             return
         }
 
-        // Everything else only speaks over silence, and only while you are using the phone.
         if (am.isMusicActive) return
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (!pm.isInteractive) return
@@ -185,28 +187,34 @@ class BubbleService : Service() {
             n.run.isNotEmpty() -> execute(n.run)
             n.offer.isNotEmpty() -> {
                 runner.offer(n.text, n.offer)
-                awaiting = true          // listen for yes / no, no wake word needed
+                awaiting = true
             }
             n.text.isNotEmpty() -> say(n.text)
         }
     }
 
-    // Called again each time you tap Start in the app, so a freshly downloaded voice gets loaded.
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(1, notif())
         loadEars()
         applyHearing()
 
-        // Retry Piper init if it was not ready when the service started
-        // (e.g. user just downloaded the voice model from the settings screen).
+        // Retry Piper init if just downloaded
         if (!NaturalVoice.isReady && NaturalVoice.isInstalled(this)) {
             Thread {
                 NaturalVoice.init(this)
             }.also { it.isDaemon = true }.start()
         }
 
-        // A pomodoro alarm asks her to say the cue out loud.
-        intent?.getStringExtra("say")?.let { text -> ui.post { say(text) } }
+        // Retry LLM load if just downloaded
+        Thread {
+            if (LocalLLM.isInstalled(this) && !LocalLLM.isReady) {
+                LocalLLM.load(this)
+            }
+            if (OfflineKnowledge.isInstalled(this) && !OfflineKnowledge.isOpen) {
+                OfflineKnowledge.open(this)
+            }
+        }.also { it.isDaemon = true }.start()
+
         return START_STICKY
     }
 
@@ -235,7 +243,6 @@ class BubbleService : Service() {
         say(msg)
     }
 
-    // Wake words come from the brain file, so you can add the ways the phone mishears "Sanya".
     private fun wake(): Regex {
         val w = (Brain.setting("wake words", "sanya").split(",").map { it.trim().lowercase() } +
             listOf("sanya", "saniya", "sania", "sunya", "sonya", "sonia", "sanja", "suniya", "shanya")).filter { it.isNotEmpty() }.distinct()
@@ -310,7 +317,7 @@ class BubbleService : Service() {
         }
     }
 
-    // ---------- Caption pill (top of screen) ----------
+    // ---------- Caption ----------
     private fun makeCaption() {
         caption = TextView(this).apply {
             textSize = 16f; setTextColor(Color.WHITE); setPadding(40, 20, 40, 20)
@@ -329,10 +336,10 @@ class BubbleService : Service() {
         ui.removeCallbacks(hideCaption); ui.postDelayed(hideCaption, ms)
     }
 
-    // ---------- Beep control (only needed for the Google voice backup) ----------
+    // ---------- Beep control ----------
     private fun muteBeep() {
         for (st in intArrayOf(AudioManager.STREAM_MUSIC, AudioManager.STREAM_SYSTEM)) {
-            if (st == AudioManager.STREAM_MUSIC && am.isMusicActive) continue   // never cut your video audio
+            if (st == AudioManager.STREAM_MUSIC && am.isMusicActive) continue
             if (muted.contains(st) || am.isStreamMute(st)) continue
             runCatching {
                 am.adjustStreamVolume(st, AudioManager.ADJUST_MUTE, 0)
@@ -347,19 +354,19 @@ class BubbleService : Service() {
     }
 
     // ---------- Speaking ----------
+    /**
+     * Speak [s] using Piper TTS when ready, falling back to Android TTS.
+     * Piper runs on its own thread and signals completion via pending counter.
+     */
     private fun say(s: String) {
         show(s)
         unmuteBeep()
-
-        // Stop Google voice listener — never listen to our own speech.
         sr?.let { if (listening) { it.cancel(); finish(it) } }
-
-        // Pause offline ears too.
         ears?.paused = true
         pending++
 
         if (NaturalVoice.isReady) {
-            // Piper TTS — runs on its own thread, calls back when done.
+            // Piper TTS — non-blocking, plays on its own thread
             Thread {
                 NaturalVoice.speak(s)
                 ui.post {
@@ -370,19 +377,16 @@ class BubbleService : Service() {
             return
         }
 
-        // ---- Original Android TTS fallback (unchanged) ----
+        // ---- Android TTS fallback ----
         val t = tts ?: run { pending = maxOf(0, pending - 1); return }
         if (!ttsReady) { pending = maxOf(0, pending - 1); return }
-
         if (t.speak(s, TextToSpeech.QUEUE_ADD, null, "u" + System.nanoTime()) == TextToSpeech.ERROR) {
-            pending = maxOf(0, pending - 1)
-            resume()
+            pending = maxOf(0, pending - 1); resume()
         }
     }
 
-    // After she finishes talking, go back to listening if hands-free (or waiting for a command)
     private fun resume() {
-        if (runner.wantsReply()) awaiting = true   // she asked something (even later, from a step): listen for the answer
+        if (runner.wantsReply()) awaiting = true
         if (offlineEars()) {
             ui.postDelayed({
                 if (pending > 0) return@postDelayed
@@ -405,8 +409,12 @@ class BubbleService : Service() {
     // ---------- Listening ----------
     private fun tap() {
         buzz()
-        if (pending > 0) { tts?.stop(); pending = 0 }   // tap = stop talking
-        awaiting = true                                  // a tap means: no wake word needed
+        if (pending > 0) {
+            tts?.stop()
+            NaturalVoice.stop()
+            pending = 0
+        }
+        awaiting = true
         if (offlineEars() && Brain.setting("tap voice", "offline") != "google") {
             ears?.paused = false
             ears?.start()
@@ -414,12 +422,11 @@ class BubbleService : Service() {
             show("Listening…")
             ui.removeCallbacks(giveUp); ui.postDelayed(giveUp, 8000)
         } else {
-            ears?.stop()                      // free the microphone for Google's recogniser
+            ears?.stop()
             if (listening) sr?.stopListening() else listen()
         }
     }
 
-    // Google voice backup (online first, offline pack if there is no internet)
     private fun listen(offline: Boolean = false) {
         if (listening || pending > 0) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) { say("No speech service on this phone"); return }
@@ -436,16 +443,16 @@ class BubbleService : Service() {
             }
             override fun onError(code: Int) {
                 finish(r)
-                if (!offline && (code == 1 || code == 2 || code == 11)) {   // no internet: try the offline pack
+                if (!offline && (code == 1 || code == 2 || code == 11)) {
                     show("Offline mode")
                     ui.post { listen(true) }
                     return
                 }
                 awaiting = false
-                if (handsFree && (code == 6 || code == 7 || code == 8)) {   // silence or busy: keep waiting
+                if (handsFree && (code == 6 || code == 7 || code == 8)) {
                     ui.postDelayed({ resume() }, if (code == 8) 1500L else 300L); return
                 }
-                if (handsFree) handsFree = false                              // real error: stop looping
+                if (handsFree) handsFree = false
                 look(IDLE, false)
                 say(explain(code))
             }
@@ -489,15 +496,13 @@ class BubbleService : Service() {
     }
 
     // ---------- Understanding ----------
-    // Google gives up to 5 guesses, Vosk gives 1. Pick the one Sanya actually understands.
     private fun heard(all: List<String>) {
         val lows = all.map { it.lowercase() }
         val pool = if (handsFree && !awaiting) lows.filter { wakeRx.containsMatchIn(it) } else lows
-        if (pool.isEmpty()) { if (!offlineEars()) resume(); return }   // not meant for me, keep waiting
+        if (pool.isEmpty()) { if (!offlineEars()) resume(); return }
         ears?.paused = true
         ui.removeCallbacks(giveUp)
         look(if (handsFree) HANDS_FREE else IDLE, false)
-        // Of the guesses she understands, prefer the one that sounds most like YOU (her own model).
         val understood = pool.filter { val c = wakeRx.replace(it, "").trim(); c.isNotEmpty() && runner.understands(c) }
         val pick = when {
             understood.size > 1 -> {
@@ -507,7 +512,7 @@ class BubbleService : Service() {
             understood.size == 1 -> understood[0]
             else -> pool.first()
         }
-        show("“$pick”")
+        show(""$pick"")
         val cmd = wakeRx.replace(pick, "").trim()
         awaiting = false
         if (cmd.isEmpty()) { awaiting = true; buzz(); say("Yes?") } else execute(cmd)
@@ -523,7 +528,7 @@ class BubbleService : Service() {
             Regex("hands.?free on|hands.?free mode|start listening").containsMatchIn(c) -> setHandsFree(true)
             else -> {
                 val n = runner.handle(c)
-                if (runner.wantsReply()) awaiting = true   // she asked a question: keep listening, no wake word
+                if (runner.wantsReply()) awaiting = true
                 wakeRx = wake()
                 applyHearing()
                 ui.postDelayed({ resume() }, n * 2500L + 1500L)
@@ -548,7 +553,6 @@ class BubbleService : Service() {
     }
 
     override fun onDestroy() {
-        alive = false
         Learner.flush(this)
         ui.removeCallbacksAndMessages(null)
         unmuteBeep()
@@ -556,9 +560,14 @@ class BubbleService : Service() {
         pulse?.cancel()
         if (::bubble.isInitialized) wm.removeView(bubble)
         if (::caption.isInitialized) wm.removeView(caption)
-        sr?.destroy(); tts?.shutdown()
+        sr?.destroy()
+        tts?.shutdown()
+        // ---- Piper TTS ----
         NaturalVoice.stop()
         NaturalVoice.release()
+        // ---- LLM and knowledge base ----
+        LocalLLM.unload()
+        OfflineKnowledge.close()
         val e = ears
         ears = null
         e?.stop()
