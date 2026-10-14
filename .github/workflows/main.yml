@@ -1,0 +1,19 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive      # needed for app/src/main/cpp/llama.cpp
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v3
+        with: { gradle-version: 8.5 }
+      - run: base64 -d app/sanya.keystore.b64 > app/sanya.keystore
+      - run: ls app/src/main/cpp/llama.cpp | head      # fails early if the submodule is missing
+      - run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: Sanya-apk, path: app/build/outputs/apk/debug/app-debug.apk }

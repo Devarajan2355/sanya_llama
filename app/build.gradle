@@ -1,0 +1,70 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+android {
+    namespace 'com.sanya.assistant'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.sanya.assistant'
+        minSdk 26
+        targetSdk 28   // 28 (not 29+) so Wi-Fi can be switched directly
+        versionCode 7
+        versionName '7.0'
+
+        // Only ship ARM ABIs
+        ndk { abiFilters 'arm64-v8a' }
+
+        // CMake build for llama.cpp JNI
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -O3 -DNDEBUG"
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DANDROID_PLATFORM=android-26",
+                          "-DLLAMA_BUILD_TESTS=OFF",
+                          "-DLLAMA_BUILD_EXAMPLES=OFF",
+                          "-DGGML_NEON=ON"
+            }
+        }
+    }
+    // Link CMakeLists.txt
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+    signingConfigs {
+        debug {
+            if (file('sanya.keystore').exists()) {
+                storeFile file('sanya.keystore')
+                // Reads GitHub Actions secrets when present. The fallback keeps today's build working;
+                // delete the  ?: 'sanya1234'  parts once the secrets are set.
+                storePassword System.getenv('SANYA_KEYSTORE_PASSWORD') ?: 'sanya1234'
+                keyAlias 'sanya'
+                keyPassword System.getenv('SANYA_KEY_PASSWORD') ?: 'sanya1234'
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    // Prevent duplicate .so files from the sherpa-onnx AAR clashing with our own llama_android.so
+    packagingOptions {
+        pickFirst 'lib/arm64-v8a/libc++_shared.so'
+        
+    }
+}
+dependencies {
+    // Existing
+    implementation 'net.java.dev.jna:jna:5.13.0@aar'
+    implementation 'com.alphacephei:vosk-android:0.3.47'
+
+    // Piper TTS (NaturalVoice.kt) loads sherpa-onnx by reflection, so it is optional.
+    // To enable it, put the sherpa-onnx Android AAR in app/libs/ and it is picked up here.
+    // (The JitPack coordinate com.github.k2-fsa:sherpa-onnx-android does not exist: 401.)
+    implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+}
