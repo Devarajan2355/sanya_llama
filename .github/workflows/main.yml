@@ -5,14 +5,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive      # needed for app/src/main/cpp/llama.cpp
+      - name: Fetch llama.cpp (not stored in the repo)
+        run: |
+          if [ ! -f app/src/main/cpp/llama.cpp/include/llama.h ]; then
+            rm -rf app/src/main/cpp/llama.cpp
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
+          fi
+          git -C app/src/main/cpp/llama.cpp log -1 --format='llama.cpp commit %H'
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v3
         with: { gradle-version: 8.5 }
       - run: base64 -d app/sanya.keystore.b64 > app/sanya.keystore
-      - run: ls app/src/main/cpp/llama.cpp | head      # fails early if the submodule is missing
       - run: gradle assembleDebug --stacktrace
       - uses: actions/upload-artifact@v4
         if: always()
