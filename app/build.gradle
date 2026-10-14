@@ -11,11 +11,7 @@ android {
         targetSdk 28   // 28 (not 29+) so Wi-Fi can be switched directly
         versionCode 7
         versionName '7.0'
-
-        // Only ship ARM ABIs
-        ndk { abiFilters 'arm64-v8a' }
-
-        // CMake build for llama.cpp JNI
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17 -O3 -DNDEBUG"
@@ -23,11 +19,11 @@ android {
                           "-DANDROID_PLATFORM=android-26",
                           "-DLLAMA_BUILD_TESTS=OFF",
                           "-DLLAMA_BUILD_EXAMPLES=OFF",
+                          "-DLLAMA_BUILD_SERVER=OFF",
                           "-DGGML_NEON=ON"
             }
         }
     }
-    // Link CMakeLists.txt
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -51,20 +47,17 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = '17' }
-
-    // Prevent duplicate .so files from the sherpa-onnx AAR clashing with our own llama_android.so
     packagingOptions {
+        // Prevent duplicate libc++_shared.so from sherpa-onnx and our own llama build
         pickFirst 'lib/arm64-v8a/libc++_shared.so'
-        
+        pickFirst 'lib/armeabi-v7a/libc++_shared.so'
     }
 }
 dependencies {
-    // Existing
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47'
-
-    // Piper TTS (NaturalVoice.kt) loads sherpa-onnx by reflection, so it is optional.
-    // To enable it, put the sherpa-onnx Android AAR in app/libs/ and it is picked up here.
-    // (The JitPack coordinate com.github.k2-fsa:sherpa-onnx-android does not exist: 401.)
-    implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+    // Piper TTS via sherpa-onnx (NaturalVoice.kt)
+    implementation 'com.github.k2-fsa:sherpa-onnx-android:1.10.22'
+    // ONNX Runtime pinned version (pulled by sherpa-onnx, pinned for stability)
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
 }
