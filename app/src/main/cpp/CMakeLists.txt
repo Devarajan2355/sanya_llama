@@ -1,14 +1,19 @@
-
 cmake_minimum_required(VERSION 3.22)
 
 project(sanya_llm LANGUAGES C CXX)
+
+# The CI builds "assembleDebug", and Gradle then runs CMake in Debug mode (-O0),
+# which makes llama.cpp many times slower. Force optimisation in Debug too.
+# Do NOT add -march=...+dotprod / +i8mm here: many Android 10 phones lack them (SIGILL).
+set(CMAKE_C_FLAGS_DEBUG   "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG "-O3 -DNDEBUG")
 
 # Android-specific build for Sanya's llama.cpp JNI library.
 # Expected layout:
 # app/src/main/cpp/
 #   CMakeLists.txt
 #   llm_jni.cpp
-#   llama.cpp/CMakeLists.txt
+#   llama.cpp/CMakeLists.txt        (cloned by the CI, not committed)
 
 if(NOT ANDROID)
     message(FATAL_ERROR "This CMakeLists.txt is intended for Android NDK builds.")
@@ -16,8 +21,8 @@ endif()
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/CMakeLists.txt")
     message(FATAL_ERROR
-        "llama.cpp is missing. Initialize the submodule at "
-        "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp"
+        "llama.cpp is missing. Clone it to "
+        "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp (CMakeLists.txt must be directly inside)."
     )
 endif()
 
