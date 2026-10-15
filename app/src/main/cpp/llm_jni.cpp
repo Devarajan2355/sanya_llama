@@ -242,21 +242,21 @@ Java_com_sanya_assistant_LocalLLM_nativeInfer(
         return env->NewStringUTF("");
     }
 
+    // Current llama.cpp signature: (penalty_last_n, penalty_repeat, penalty_freq, penalty_present)
     llama_sampler_chain_add(
         sampler,
         llama_sampler_init_penalties(
-            llama_vocab_n_tokens(vocab),
-            64,     // Repetition history
-            1.15f,  // Repetition penalty
-            0.0f,   // Frequency penalty
-            0.0f    // Presence penalty
+            64,     // repetition history
+            1.15f,  // repetition penalty
+            0.0f,   // frequency penalty
+            0.0f    // presence penalty
         )
     );
 
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(42));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     std::string result;
     result.reserve(512);
