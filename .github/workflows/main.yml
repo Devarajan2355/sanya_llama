@@ -5,37 +5,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Fetch llama.cpp only if the copy in the repo is incomplete
+      - name: Get llama.cpp
         run: |
-          D=app/src/main/cpp/llama.cpp
-          if [ ! -f $D/include/llama.h ] || [ ! -f $D/ggml/CMakeLists.txt ] || [ ! -f $D/src/CMakeLists.txt ]; then
-            rm -rf $D
-            git clone --depth 1 https://github.com/ggml-org/llama.cpp $D
+          if [ ! -f app/src/main/cpp/llama.cpp/CMakeLists.txt ]; then
+            rm -rf app/src/main/cpp/llama.cpp
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
           fi
-          git -C $D log -1 --format='llama.cpp commit %H' || true
-
-      - name: Fetch sherpa-onnx (native libs + Kotlin API, same release tag)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG=$(gh release view -R k2-fsa/sherpa-onnx --json tagName -q .tagName)
-          echo "sherpa-onnx release: $TAG"
-          mkdir -p /tmp/sherpa/x
-          gh release download "$TAG" -R k2-fsa/sherpa-onnx --pattern '*-android.tar.bz2' --dir /tmp/sherpa
-          tar xjf /tmp/sherpa/*-android.tar.bz2 -C /tmp/sherpa/x
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          cp -v /tmp/sherpa/x/jniLibs/arm64-v8a/*.so app/src/main/jniLibs/arm64-v8a/
-          git clone --depth 1 --branch "$TAG" https://github.com/k2-fsa/sherpa-onnx /tmp/sherpa/src
-          mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
-          cp -v /tmp/sherpa/src/sherpa-onnx/kotlin-api/*.kt app/src/main/java/com/k2fsa/sherpa/onnx/
-
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v3
         with: { gradle-version: 8.5 }
       - run: base64 -d app/sanya.keystore.b64 > app/sanya.keystore
-      - run: gradle assembleDebug --stacktrace
+      - run: gradle assembleDebug
       - uses: actions/upload-artifact@v4
-        if: always()
         with: { name: Sanya-apk, path: app/build/outputs/apk/debug/app-debug.apk }
