@@ -11,16 +11,12 @@ android {
         targetSdk 28   // 28 (not 29+) so Wi-Fi can be switched directly
         versionCode 7
         versionName '7.0'
-        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
+        ndk { abiFilters 'arm64-v8a' }   // llama.cpp is only practical on 64-bit ARM
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17 -O3 -DNDEBUG"
                 arguments "-DANDROID_STL=c++_shared",
-                          "-DANDROID_PLATFORM=android-26",
-                          "-DLLAMA_BUILD_TESTS=OFF",
-                          "-DLLAMA_BUILD_EXAMPLES=OFF",
-                          "-DLLAMA_BUILD_SERVER=OFF",
-                          "-DGGML_NEON=ON"
+                          "-DANDROID_PLATFORM=android-26"
             }
         }
     }
@@ -34,8 +30,6 @@ android {
         debug {
             if (file('sanya.keystore').exists()) {
                 storeFile file('sanya.keystore')
-                // Reads GitHub Actions secrets when present. The fallback keeps today's build working;
-                // delete the  ?: 'sanya1234'  parts once the secrets are set.
                 storePassword System.getenv('SANYA_KEYSTORE_PASSWORD') ?: 'sanya1234'
                 keyAlias 'sanya'
                 keyPassword System.getenv('SANYA_KEY_PASSWORD') ?: 'sanya1234'
@@ -48,16 +42,31 @@ android {
     }
     kotlinOptions { jvmTarget = '17' }
     packagingOptions {
-        // Prevent duplicate libc++_shared.so from sherpa-onnx and our own llama build
         pickFirst 'lib/arm64-v8a/libc++_shared.so'
-        pickFirst 'lib/armeabi-v7a/libc++_shared.so'
     }
 }
 dependencies {
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47'
-    // Piper TTS via sherpa-onnx (NaturalVoice.kt)
-    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")
-    // ONNX Runtime pinned version (pulled by sherpa-onnx, pinned for stability)
-    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
+
+    // ---------------------------------------------------------------
+    // Natural voice (Piper TTS via sherpa-onnx)
+    //
+    // sherpa-onnx is NOT on JitPack or Maven Central.
+    // It ships as a pre-built AAR on GitHub Releases.
+    //
+    // TO ENABLE NATURAL VOICE:
+    //   1. Download the AAR from GitHub:
+    //      https://github.com/k2-fsa/sherpa-onnx/releases
+    //      Look for: sherpa-onnx-v<latest>-android.tar.bz2
+    //      Extract and copy sherpa-onnx-android.aar into app/libs/
+    //
+    //   2. Uncomment the two lines below:
+    //
+    // implementation fileTree(dir: 'libs', include: ['*.aar'])
+    // implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
+    //
+    // Until then, NaturalVoice.kt compiles fine (it uses reflection)
+    // and falls back to Android's built-in TTS automatically.
+    // ---------------------------------------------------------------
 }
