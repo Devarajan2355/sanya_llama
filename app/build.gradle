@@ -1,3 +1,4 @@
+```gradle
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
@@ -10,25 +11,29 @@ android {
     defaultConfig {
         applicationId 'com.sanya.assistant'
         minSdk 26
-        targetSdk 28   // 28 (not 29+) so Wi-Fi can be switched directly
+        targetSdk 28
+
         versionCode 7
         versionName '7.0'
 
-        ndk { abiFilters 'arm64-v8a' }   // llama.cpp is only practical on 64-bit ARM
+        // llama.cpp native library target
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
 
         externalNativeBuild {
             cmake {
-                cppFlags "-std=c++17 -O3 -DNDEBUG"
+                cppFlags "-std=c++17"
+
                 arguments "-DANDROID_STL=c++_shared",
-                          "-DANDROID_PLATFORM=android-26",
-                          "-DCMAKE_BUILD_TYPE=Release"
+                          "-DANDROID_PLATFORM=android-26"
             }
         }
     }
 
     externalNativeBuild {
         cmake {
-            path "src/main/cpp/CMakeLists.txt"
+            path file("src/main/cpp/CMakeLists.txt")
             version "3.22.1"
         }
     }
@@ -65,7 +70,10 @@ dependencies {
     implementation 'com.alphacephei:vosk-android:0.3.47'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 
-    // Natural voice (NaturalVoice.kt): sherpa-onnx from JitPack, plus a reader for .tar.bz2 voice packs.
+    // Natural voice using Sherpa-ONNX
     implementation 'com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8'
+
+    // Read .tar.bz2 voice packs
     implementation 'org.apache.commons:commons-compress:1.26.1'
 }
+```
