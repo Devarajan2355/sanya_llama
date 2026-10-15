@@ -5,17 +5,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Get llama.cpp
+
+      - name: Get llama.cpp (pinned)
         run: |
           if [ ! -f app/src/main/cpp/llama.cpp/CMakeLists.txt ]; then
             rm -rf app/src/main/cpp/llama.cpp
-            git clone --depth 1 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
+            git clone --depth 1 --branch b6000 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
           fi
+          grep -n -A5 "llama_sampler_init_penalties" app/src/main/cpp/llama.cpp/include/llama.h || true
+
       - uses: actions/setup-java@v5
-        with: { distribution: temurin, java-version: 17 }
+        with:
+          distribution: temurin
+          java-version: 17
+
       - uses: gradle/actions/setup-gradle@v3
-        with: { gradle-version: 8.5 }
+        with:
+          gradle-version: 8.5
+
       - run: base64 -d app/sanya.keystore.b64 > app/sanya.keystore
-      - run: gradle assembleDebug
+
+      - run: gradle assembleDebug --stacktrace
+
       - uses: actions/upload-artifact@v4
-        with: { name: Sanya-apk, path: app/build/outputs/apk/debug/app-debug.apk }
+        with:
+          name: Sanya-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
