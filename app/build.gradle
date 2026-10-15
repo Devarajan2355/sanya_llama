@@ -2,30 +2,37 @@ plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
 }
+
 android {
     namespace 'com.sanya.assistant'
     compileSdk 34
+
     defaultConfig {
         applicationId 'com.sanya.assistant'
         minSdk 26
         targetSdk 28   // 28 (not 29+) so Wi-Fi can be switched directly
         versionCode 7
         versionName '7.0'
+
         ndk { abiFilters 'arm64-v8a' }   // llama.cpp is only practical on 64-bit ARM
+
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17 -O3 -DNDEBUG"
                 arguments "-DANDROID_STL=c++_shared",
-                          "-DANDROID_PLATFORM=android-26"
+                          "-DANDROID_PLATFORM=android-26",
+                          "-DCMAKE_BUILD_TYPE=Release"
             }
         }
     }
+
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
             version "3.22.1"
         }
     }
+
     signingConfigs {
         debug {
             if (file('sanya.keystore').exists()) {
@@ -36,22 +43,29 @@ android {
             }
         }
     }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = '17' }
-    packagingOptions {
-        pickFirst 'lib/arm64-v8a/libc++_shared.so'
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    packaging {
+        jniLibs {
+            pickFirsts += ['lib/arm64-v8a/libc++_shared.so']
+        }
     }
 }
+
 dependencies {
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 
     // Natural voice (NaturalVoice.kt): sherpa-onnx from JitPack, plus a reader for .tar.bz2 voice packs.
-    // Needs  maven { url = uri("https://jitpack.io") }  in settings.gradle.
     implementation 'com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8'
     implementation 'org.apache.commons:commons-compress:1.26.1'
 }
