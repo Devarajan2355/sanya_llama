@@ -3,222 +3,263 @@ package com.sanya.assistant
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioTrack
+import com.k2fsa.sherpa.onnx.OfflineTts
+import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import java.io.File
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * NaturalVoice: Piper neural TTS via the sherpa-onnx Android AAR.
+ * NaturalVoice: Piper neural text-to-speech through sherpa-onnx. Fully offline.
  *
- * Piper sounds vastly more natural than Android's built-in TTS engine.
- * It runs fully offline, produces audio in ~200 ms on mid-range phones,
- * and uses ~60 MB for one voice model.
+ * Uses sherpa-onnx's own packaged Piper voice (it already contains the pieces Piper needs:
+ * the .onnx model, tokens.txt and the espeak-ng-data folder), about 67 MB to download once.
+ * It is unpacked into files/piper-voice/.
  *
- * Dependency (add to app/build.gradle):
- *   implementation 'com.github.k2-fsa:sherpa-onnx-android:1.10.22'
- *   // Maven repo: https://jitpack.io
+ * Dependencies (app/build.gradle):
+ *   implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")   // JitPack
+ *   implementation("org.apache.commons:commons-compress:1.26.1")          // reads .tar.bz2
  *
- * Voice model (downloaded once, ~60 MB):
- *   en_US-lessac-medium.onnx   — clear US-accented English
- *   en_US-lessac-medium.onnx.json  — config file alongside the model
- *
- * Alternate voices (swap the URL pair):
- *   en_IN-southern_english_female-low.onnx  ~28 MB  Indian accent
- *   en_GB-cori-medium.onnx                  ~63 MB  British English
- *
- * Usage:
- *   NaturalVoice.init(ctx)           // call once from a background thread
- *   NaturalVoice.speak("Hello")      // blocking — call from background thread
- *   NaturalVoice.stop()              // interrupt current speech
- *   NaturalVoice.isReady             // false until init() finishes
- *
- * BubbleService uses this when isReady == true, falls back to Android TTS otherwise.
+ * BubbleService uses it when isReady is true and falls back to Android's TTS otherwise.
+ *   NaturalVoice.init(ctx)    background thread, once
+ *   NaturalVoice.speak(text)  blocks until finished (call from a background thread)
+ *   NaturalVoice.stop()       interrupts what is playing and drops anything queued
  */
 object NaturalVoice {
 
-    // ---- model URLs (two files required by Piper / sherpa-onnx) ----
-    private const val MODEL_URL =
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/" +
-        "en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-    private const val CONFIG_URL =
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/" +
-        "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+    // Other voices from the same release: swap PACKAGE and FOLDER and the model file name.
+    private const val PACKAGE = "vits-piper-en_US-lessac-medium"
+    private const val URL_BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
+    private const val MODEL_NAME = "en_US-lessac-medium.onnx"
 
-    private const val MODEL_FILE  = "piper-voice.onnx"
-    private const val CONFIG_FILE = "piper-voice.onnx.json"
+    private const val DIR = "piper-voice"
+    private const val MARKER = ".installed"
 
-    private const val SAMPLE_RATE = 22050   // Piper outputs 22 050 Hz mono PCM16
-
-    @Volatile private var tts: Any?  = null   // k2fsa.sherpa_onnx.OfflineTts (reflection)
-    @Volatile private var playing    = false
+    @Volatile private var tts: OfflineTts? = null
     @Volatile private var track: AudioTrack? = null
+    @Volatile private var generation = 0          // bumped by stop(): queued speech is dropped
+    private val speakLock = Any()                  // one utterance at a time, in order
 
-    val isReady get() = tts != null
+    val isReady: Boolean get() = tts != null
 
     // ---------------------------------------------------------------
-    // Installation
+    // Files
     // ---------------------------------------------------------------
 
-    fun modelFile(ctx:  Context) = File(ctx.filesDir, MODEL_FILE)
-    fun configFile(ctx: Context) = File(ctx.filesDir, CONFIG_FILE)
+    private fun dir(ctx: Context) = File(ctx.filesDir, DIR)
 
-    fun isInstalled(ctx: Context) =
-        modelFile(ctx).exists()  && modelFile(ctx).length()  > 1_000_000L &&
-        configFile(ctx).exists() && configFile(ctx).length() > 100L
+    /** The voice model file (used by the Health check to show a size). */
+    fun modelFile(ctx: Context) = File(dir(ctx), MODEL_NAME)
 
-    /** Download both model files. Returns null on success. */
-    fun download(ctx: Context, onProgress: (Int) -> Unit): String? {
-        val files = listOf(MODEL_URL to MODEL_FILE, CONFIG_URL to CONFIG_FILE)
-        for ((url, name) in files) {
-            val err = downloadFile(ctx, url, name) { p ->
-                // Model is ~60 MB, config is tiny — report model progress as 0-95, config as 95-100
-                val adj = if (name == MODEL_FILE) (p * 95) / 100 else 95 + (p * 5) / 100
-                onProgress(adj)
-            }
-            if (err != null) return err
-        }
-        onProgress(100)
-        return null
+    fun isInstalled(ctx: Context): Boolean {
+        val d = dir(ctx)
+        return File(d, MARKER).exists() &&
+            modelFile(ctx).exists() &&
+            File(d, "tokens.txt").exists() &&
+            File(d, "espeak-ng-data").isDirectory
     }
 
-    private fun downloadFile(
-        ctx:        Context,
-        url:        String,
-        filename:   String,
-        onProgress: (Int) -> Unit
-    ): String? {
+    // ---------------------------------------------------------------
+    // Download and unpack. Returns null on success, or a short error.
+    // Progress: 0-90 while downloading, 90-100 while unpacking.
+    // ---------------------------------------------------------------
+
+    fun download(ctx: Context, onProgress: (Int) -> Unit): String? {
+
+        val tmp = File(ctx.cacheDir, "piper-voice.tar.bz2")
+        val fresh = File(ctx.filesDir, "$DIR-new")
+
         return try {
-            val tmp  = File(ctx.cacheDir, "$filename.tmp")
-            val conn = URL(url).openConnection() as HttpURLConnection
+            val conn = URL(URL_BASE + PACKAGE + ".tar.bz2").openConnection() as HttpURLConnection
             conn.connectTimeout = 20_000
-            conn.readTimeout    = 60_000
+            conn.readTimeout = 60_000
+            conn.instanceFollowRedirects = true
+
+            if (conn.responseCode !in 200..299) return "Server said ${conn.responseCode}"
+
             val total = conn.contentLengthLong
-            conn.inputStream.use { inp ->
+
+            conn.inputStream.use { input ->
                 tmp.outputStream().use { out ->
-                    val buf  = ByteArray(65_536)
-                    var done = 0L; var last = -1
+                    val buf = ByteArray(65_536)
+                    var done = 0L
+                    var last = -1
                     while (true) {
-                        val n = inp.read(buf); if (n < 0) break
-                        out.write(buf, 0, n); done += n
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        done += n
                         if (total > 0) {
-                            val p = (done * 100 / total).toInt()
+                            val p = (done * 90 / total).toInt()
                             if (p != last) { last = p; onProgress(p) }
                         }
                     }
                 }
             }
-            val dest = File(ctx.filesDir, filename)
-            if (tmp.renameTo(dest)) null else "Could not install $filename"
-        } catch (e: Exception) { e.message ?: "Download failed: $filename" }
+
+            fresh.deleteRecursively()
+            fresh.mkdirs()
+            unpack(tmp, fresh, onProgress)
+            tmp.delete()
+
+            if (!File(fresh, MODEL_NAME).exists() ||
+                !File(fresh, "tokens.txt").exists() ||
+                !File(fresh, "espeak-ng-data").isDirectory
+            ) {
+                fresh.deleteRecursively()
+                return "Voice files were missing after unpacking"
+            }
+
+            File(fresh, MARKER).writeText("ok")
+
+            release()                              // free the old engine before replacing its files
+            dir(ctx).deleteRecursively()
+
+            if (fresh.renameTo(dir(ctx))) {
+                onProgress(100)
+                null
+            } else {
+                "Could not install the voice"
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            fresh.deleteRecursively()
+            e.message ?: "Download failed"
+        }
+    }
+
+    // Counts compressed bytes read so unpacking can show progress.
+    private class Counting(input: InputStream, val total: Long, val report: (Int) -> Unit) : FilterInputStream(input) {
+        private var read = 0L
+        private var last = -1
+        private fun add(n: Int) {
+            if (n <= 0 || total <= 0) return
+            read += n
+            val p = 90 + (read * 10 / total).toInt().coerceAtMost(9)
+            if (p != last) { last = p; report(p) }
+        }
+        override fun read(): Int { val b = super.read(); if (b >= 0) add(1); return b }
+        override fun read(b: ByteArray, off: Int, len: Int): Int { val n = super.read(b, off, len); add(n); return n }
+    }
+
+    // tar.bz2 -> folder, dropping the top-level folder name and refusing paths that escape.
+    private fun unpack(archive: File, into: File, onProgress: (Int) -> Unit) {
+
+        val root = into.canonicalPath + File.separator
+
+        Counting(archive.inputStream().buffered(), archive.length(), onProgress).use { counted ->
+            TarArchiveInputStream(BZip2CompressorInputStream(counted)).use { tar ->
+                while (true) {
+                    val entry = tar.nextTarEntry ?: break
+                    val rel = entry.name.substringAfter('/', "")
+                    if (rel.isEmpty()) continue
+
+                    val target = File(into, rel)
+                    if (!target.canonicalPath.startsWith(root)) throw Exception("Unsafe path in voice package")
+
+                    if (entry.isDirectory) {
+                        target.mkdirs()
+                    } else {
+                        target.parentFile?.mkdirs()
+                        target.outputStream().use { tar.copyTo(it) }
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------
-    // Lifecycle  (call from a background thread)
+    // Engine
     // ---------------------------------------------------------------
 
-    /**
-     * Initialise the Piper TTS engine.
-     * Uses reflection so the code compiles even if the sherpa-onnx AAR
-     * is not yet added — isReady will just stay false.
-     */
+    /** Load the voice. Call from a background thread. Returns true if ready. */
+    @Synchronized
     fun init(ctx: Context): Boolean {
+
         if (tts != null) return true
         if (!isInstalled(ctx)) return false
+
         return try {
-            // Equivalent to:
-            //   val config = OfflineTtsConfig(
-            //       model = OfflineTtsModelConfig(
-            //           vits = OfflineTtsVitsModelConfig(
-            //               model  = modelFile(ctx).absolutePath,
-            //               lexicon = "",
-            //               tokens = configFile(ctx).absolutePath
-            //           )
-            //       )
-            //   )
-            //   tts = OfflineTts(ctx, config)
-            //
-            // We use reflection so the app still builds without the AAR
-            // and NaturalVoice.isReady simply returns false.
+            val d = dir(ctx)
 
-            val vitsClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig")
-            val vitsConfig = vitsClass.getConstructor(String::class.java, String::class.java, String::class.java)
-                .newInstance(modelFile(ctx).absolutePath, "", configFile(ctx).absolutePath)
+            val config = OfflineTtsConfig(
+                model = OfflineTtsModelConfig(
+                    vits = OfflineTtsVitsModelConfig(
+                        model = File(d, MODEL_NAME).absolutePath,
+                        tokens = File(d, "tokens.txt").absolutePath,
+                        dataDir = File(d, "espeak-ng-data").absolutePath
+                    ),
+                    numThreads = 2,
+                    debug = false,
+                    provider = "cpu"
+                )
+            )
 
-            val modelCfgClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsModelConfig")
-            val modelCfg = modelCfgClass.getConstructor(vitsClass)
-                .newInstance(vitsConfig)
-
-            val cfgClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsConfig")
-            val cfg = cfgClass.getConstructor(modelCfgClass)
-                .newInstance(modelCfg)
-
-            val ttsClass = Class.forName("com.k2fsa.sherpa.onnx.OfflineTts")
-            tts = ttsClass.getConstructor(Context::class.java, cfgClass)
-                .newInstance(ctx, cfg)
-
+            tts = OfflineTts(null, config)      // null = read from files, not from app assets
             true
         } catch (e: Throwable) {
+            ErrorLog.add(ctx, "Natural voice", e)
+            tts = null
             false
         }
     }
 
+    @Synchronized
     fun release() {
         stop()
-        runCatching { tts?.javaClass?.getMethod("release")?.invoke(tts) }
+        val engine = tts
         tts = null
+        try { engine?.release() } catch (e: Throwable) { }
     }
 
     // ---------------------------------------------------------------
-    // Speaking  (call from a background thread — blocks until done)
+    // Speaking (blocks until finished or stopped)
     // ---------------------------------------------------------------
 
-    /**
-     * Synthesise [text] and play it immediately.
-     * Returns when the audio is finished (or stopped).
-     */
     fun speak(text: String) {
-        val engine = tts ?: return
+
         if (text.isBlank()) return
 
-        stop()  // interrupt anything playing
+        val mine = generation
 
-        try {
-            // Call OfflineTts.generate(text, speed, sid) → GeneratedAudio
-            val genMethod = engine.javaClass.getMethod(
-                "generate", String::class.java, Float::class.java, Int::class.java
-            )
-            val audio = genMethod.invoke(engine, text, 1.0f, 0) ?: return
+        synchronized(speakLock) {
 
-            // GeneratedAudio has a .samples: FloatArray and .sampleRate: Int
-            val samplesField = audio.javaClass.getField("samples")
-            val samples = samplesField.get(audio) as? FloatArray ?: return
+            if (mine != generation) return          // stop() was called while this was queued
 
-            playPcmFloat(samples)
-        } catch (e: Throwable) {
-            // Silently fall back to Android TTS (handled by BubbleService)
+            val engine = tts ?: return
+
+            try {
+                val audio = engine.generate(text, 0, 1.0f)       // text, speaker id, speed
+                if (mine != generation) return
+                play(audio.samples, audio.sampleRate, mine)
+            } catch (e: Throwable) {
+                // Android TTS is the fallback; a failed sentence is just skipped.
+            }
         }
     }
 
-    /** Interrupt any ongoing speech immediately. */
+    /** Interrupts what is playing and cancels anything waiting to be spoken. */
     fun stop() {
-        playing = false
-        runCatching { track?.stop(); track?.release() }
+        generation++
+        val t = track
         track = null
+        try { t?.pause(); t?.flush(); t?.stop() } catch (e: Throwable) { }
+        try { t?.release() } catch (e: Throwable) { }
     }
 
-    // ---------------------------------------------------------------
-    // PCM playback
-    // ---------------------------------------------------------------
+    private fun play(samples: FloatArray, sampleRate: Int, mine: Int) {
 
-    private fun playPcmFloat(samples: FloatArray) {
         if (samples.isEmpty()) return
 
-        val minBuf = AudioTrack.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT
+        val minBytes = AudioTrack.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT
         )
 
         val at = AudioTrack.Builder()
@@ -230,33 +271,39 @@ object NaturalVoice {
             )
             .setAudioFormat(
                 AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE)
+                    .setSampleRate(sampleRate)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                     .build()
             )
-            .setBufferSizeInBytes(maxOf(minBuf, samples.size * 4))
-            .setTransferMode(AudioTrack.MODE_STATIC)
+            .setBufferSizeInBytes(maxOf(minBytes, 16_384))
+            .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
-        track   = at
-        playing = true
+        track = at
 
-        at.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-        at.play()
+        try {
+            at.play()
 
-        // Wait for playback to finish or be stopped.
-        val durationMs = (samples.size.toLong() * 1000L) / SAMPLE_RATE
-        val deadline   = System.currentTimeMillis() + durationMs + 500L
+            var offset = 0
+            while (offset < samples.size && mine == generation) {
+                val n = at.write(samples, offset, minOf(4096, samples.size - offset), AudioTrack.WRITE_BLOCKING)
+                if (n <= 0) break
+                offset += n
+            }
 
-        while (playing && at.playState == AudioTrack.PLAYSTATE_PLAYING
-               && System.currentTimeMillis() < deadline) {
-            Thread.sleep(50)
+            // Everything is queued; wait for it to actually finish playing.
+            val deadline = System.currentTimeMillis() + samples.size * 1000L / sampleRate + 1500L
+            while (mine == generation &&
+                at.playbackHeadPosition < samples.size &&
+                System.currentTimeMillis() < deadline
+            ) {
+                Thread.sleep(40)
+            }
+        } finally {
+            if (track === at) track = null
+            try { at.stop() } catch (e: Throwable) { }
+            try { at.release() } catch (e: Throwable) { }
         }
-
-        at.stop()
-        at.release()
-        if (track === at) track = null
-        playing = false
     }
 }
