@@ -6,12 +6,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get llama.cpp (pinned)
+      - name: Get llama.cpp
         run: |
           if [ ! -f app/src/main/cpp/llama.cpp/CMakeLists.txt ]; then
             rm -rf app/src/main/cpp/llama.cpp
-            git clone --depth 1 --branch b6000 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
           fi
+          git -C app/src/main/cpp/llama.cpp log -1 --format=%H 2>/dev/null || true
           grep -n -A5 "llama_sampler_init_penalties" app/src/main/cpp/llama.cpp/include/llama.h || true
 
       - uses: actions/setup-java@v5
