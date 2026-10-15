@@ -48,6 +48,7 @@ android {
 dependencies {
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 
     // Natural voice (NaturalVoice.kt): sherpa-onnx from JitPack, plus a reader for .tar.bz2 voice packs.
     // Needs  maven { url = uri("https://jitpack.io") }  in settings.gradle.
