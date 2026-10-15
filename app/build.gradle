@@ -48,26 +48,9 @@ android {
 dependencies {
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47'
-    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")
 
-    // ---------------------------------------------------------------
-    // Natural voice (Piper TTS via sherpa-onnx)
-    //
-    // sherpa-onnx is NOT on JitPack or Maven Central.
-    // It ships as a pre-built AAR on GitHub Releases.
-    //
-    // TO ENABLE NATURAL VOICE:
-    //   1. Download the AAR from GitHub:
-    //      https://github.com/k2-fsa/sherpa-onnx/releases
-    //      Look for: sherpa-onnx-v<latest>-android.tar.bz2
-    //      Extract and copy sherpa-onnx-android.aar into app/libs/
-    //
-    //   2. Uncomment the two lines below:
-    //
-    // implementation fileTree(dir: 'libs', include: ['*.aar'])
-    // implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
-    //
-    // Until then, NaturalVoice.kt compiles fine (it uses reflection)
-    // and falls back to Android's built-in TTS automatically.
-    // ---------------------------------------------------------------
+    // Natural voice (NaturalVoice.kt): sherpa-onnx from JitPack, plus a reader for .tar.bz2 voice packs.
+    // Needs  maven { url = uri("https://jitpack.io") }  in settings.gradle.
+    implementation 'com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8'
+    implementation 'org.apache.commons:commons-compress:1.26.1'
 }
