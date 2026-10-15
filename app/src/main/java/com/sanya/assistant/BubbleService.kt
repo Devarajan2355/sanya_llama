@@ -512,7 +512,7 @@ class BubbleService : Service() {
             understood.size == 1 -> understood[0]
             else -> pool.first()
         }
-        show(""$pick"")
+        show("\u201C$pick\u201D")
         val cmd = wakeRx.replace(pick, "").trim()
         awaiting = false
         if (cmd.isEmpty()) { awaiting = true; buzz(); say("Yes?") } else execute(cmd)
