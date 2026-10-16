@@ -368,13 +368,11 @@ class StepRunner(
 
     private data class Contact(val id: Long, val name: String, val number: String)
 
-    // PATCH 1: init block — boot LLM and knowledge base alongside Brain.setup
+    // The offline knowledge base is small, so it is opened at start. The LLM is NOT loaded here:
+    // it loads on first use (LocalLLM.ensureLoaded) and frees itself after 5 idle minutes.
     init {
         Brain.setup(ctx)
         Thread {
-            if (LocalLLM.isInstalled(ctx) && !LocalLLM.isReady) {
-                LocalLLM.load(ctx)
-            }
             if (OfflineKnowledge.isInstalled(ctx) && !OfflineKnowledge.isOpen) {
                 OfflineKnowledge.open(ctx)
             }
@@ -411,6 +409,14 @@ class StepRunner(
         return best
     }
 
+    // Is this an explicit LLM task (explain / summarise / translate / write ...)?
+    // The sentence must START like one, and the LLM must be downloaded. "translate" is always
+    // accepted, because Indian-language translation can use Google Translate instead.
+    private fun llmTask(text: String): Boolean {
+        if (!LocalLLM.looksLikeLLMTask(text)) return false
+        return LocalLLM.isInstalled(ctx) || text.trim().lowercase().startsWith("translate")
+    }
+
     fun understands(input: String): Boolean {
         if (pendingValid()) return true
         if (correctionFor(input) != null) return true
@@ -421,7 +427,7 @@ class StepRunner(
         if (Money.parse(raw) != null) return true
         if (Study.parse(raw) != null) return true
         val effective = followUp(raw) ?: raw
-        if (LocalLLM.isReady && LocalLLM.looksLikeLLMTask(effective)) return true
+        if (llmTask(effective)) return true
         if (IntentEngine.isGeneralQuestion(effective)) return true
         val p = plan(raw)
         if (p.isNotEmpty() && p.none { it is Step.Unknown }) return true
@@ -467,9 +473,11 @@ class StepRunner(
         val effective = followUp(raw) ?: raw
 
         // ---------------------------------------------------------
-        // PATCH 2: Explicit LLM tasks — translate, summarise, explain, write, correct
+        // Explicit LLM tasks: translate, summarise, explain, write, correct.
+        // Only sentences that START like one of these come here, so ordinary
+        // commands ("write a note buy milk", "play songs in tamil") are never stolen.
         // ---------------------------------------------------------
-        if (LocalLLM.isReady && LocalLLM.looksLikeLLMTask(effective)) {
+        if (llmTask(effective)) {
             Mind.record(ctx, Brain.clean(effective), true)
             handleLLMTask(effective)
             return 1
@@ -786,8 +794,24 @@ class StepRunner(
         return null
     }
 
-    // PATCH 3: answerGeneralQuestion — new pipeline with offline-first approach
+    // ---------------------------------------------------------------
+    // Answering a general question
+    //
+    // Order (the first that gives a good answer wins):
+    //   0  what YOU taught her (Brain "fact" rows)                       offline
+    //   1  AIBrain built-ins (exact facts, maths, time)                  offline, never cached
+    //   2  cache of an earlier answer                                    offline
+    //   3  web, FIRST for "current / who is the president ..." questions needs internet
+    //   4  offline Wikipedia (NOT for time-sensitive questions)          offline
+    //   5  LLM + Wikipedia context (NOT for time-sensitive)              offline, not cached
+    //   6  web                                                           needs internet
+    //   7  LLM alone, hedged ("I'm not certain, but ...")                offline, not cached
+    //
+    // LLM answers are never cached, because a 360M model can be wrong and a cached
+    // wrong answer would be repeated.
+    // ---------------------------------------------------------------
     private fun answerGeneralQuestion(raw: String) {
+
         val taught = Mind.taughtAnswer(raw)
         if (taught != null) { rememberKnowledge(IntentEngine.normalizeQuestion(raw), taught); say(taught); return }
 
@@ -796,61 +820,95 @@ class StepRunner(
 
         knowledgeExecutor.execute {
             try {
-                // 1. KnowledgeStore: cached answer from a previous web search
-                val local = KnowledgeStore.find(ctx, question)
-                if (local != null) {
-                    val natural = SanyaResponseEngine.answer(question, local.answer)
-                    if (natural != null) { rememberKnowledge(question, natural); safeSay(natural); return@execute }
+                val timeSensitive = IntentEngine.isTimeSensitiveQuestion(question)
+                val net = online()
+                var webTried = false
+
+                fun done(text: String, cache: Boolean = true) {
+                    if (cache) KnowledgeStore.save(ctx, question, text)
+                    rememberKnowledge(question, text)
+                    safeSay(text)
                 }
 
-                // 2. Offline knowledge database (Wikipedia — no internet)
-                if (OfflineKnowledge.isOpen) {
-                    val direct = OfflineKnowledge.directAnswer(question)
-                    if (direct != null) {
-                        val natural = SanyaResponseEngine.answer(question, direct)
-                        if (natural != null) { rememberKnowledge(question, natural); safeSay(natural); return@execute }
-                    }
+                fun web(): String? {
+                    webTried = true
+                    val a = WebSearch.answer(question)
+                    return if (a.isNullOrBlank()) null else SanyaResponseEngine.answer(question, a)
                 }
 
-                // 3. Local LLM with offline knowledge context (no internet)
-                if (LocalLLM.isReady) {
-                    val context = if (OfflineKnowledge.isOpen) OfflineKnowledge.findContext(question) else null
-                    val llmAnswer = if (context != null) {
-                        LocalLLM.complete(
-                            system = "You are Sanya, a concise voice assistant. " +
-                                "Use the background knowledge below to answer in 1-2 short sentences. " +
-                                "No markdown. If the background doesn't help, answer from your own knowledge.\n\n$context",
-                            user = question, temp = 0.3f
-                        )
-                    } else {
-                        LocalLLM.answerQuestion(question)
-                    }
-                    if (!llmAnswer.isNullOrBlank()) {
-                        val natural = SanyaResponseEngine.answer(question, llmAnswer) ?: llmAnswer
-                        KnowledgeStore.save(ctx, question, natural)
-                        rememberKnowledge(question, natural); safeSay(natural); return@execute
-                    }
-                }
-
-                // 4. AIBrain built-ins (offline, unchanged)
+                // 1. Built-ins
                 val builtIn = AIBrain.answer(raw)
                 if (builtIn != null) {
-                    val natural = SanyaResponseEngine.answer(question, builtIn) ?: builtIn
-                    KnowledgeStore.save(ctx, question, natural)
-                    rememberKnowledge(question, natural); safeSay(natural); return@execute
+                    done(SanyaResponseEngine.answer(question, builtIn) ?: builtIn, false)
+                    return@execute
                 }
 
-                // 5. WebSearch — needs internet
-                if (!online()) { safeSay("I don't know that yet, and I can't search without internet right now."); return@execute }
+                // 2. Cache of an earlier (web) answer
+                val cached = KnowledgeStore.find(ctx, question)
+                if (cached != null) {
+                    val natural = SanyaResponseEngine.answer(question, cached.answer)
+                    if (natural != null) {
+                        rememberKnowledge(question, natural)
+                        safeSay(natural)
+                        return@execute
+                    }
+                }
 
-                val webAnswer = WebSearch.answer(question)
-                if (webAnswer.isNullOrBlank()) { safeSay("I couldn't find a reliable answer right now."); return@execute }
+                // 3. Questions about the present: ask the web first
+                if (timeSensitive && net) {
+                    val a = web()
+                    if (a != null) { done(a); return@execute }
+                }
 
-                val natural = SanyaResponseEngine.answer(question, webAnswer)
-                if (natural.isNullOrBlank()) { safeSay("I couldn't find a reliable answer right now."); return@execute }
+                // 4. Offline Wikipedia (a snapshot, so never for time-sensitive questions)
+                if (!timeSensitive && OfflineKnowledge.isOpen) {
+                    val direct = OfflineKnowledge.directAnswer(question)
+                    val natural = if (direct != null) SanyaResponseEngine.answer(question, direct) else null
+                    if (natural != null) { done(natural); return@execute }
+                }
 
-                KnowledgeStore.save(ctx, question, natural)
-                rememberKnowledge(question, natural); safeSay(natural)
+                // 5. LLM, with Wikipedia as its source
+                if (!timeSensitive && OfflineKnowledge.isOpen && LocalLLM.isInstalled(ctx)) {
+                    val context = OfflineKnowledge.findContext(question)
+                    if (context != null) {
+                        if (!LocalLLM.isReady) ui.post { quiet("Waking up my AI brain…") }
+                        if (LocalLLM.ensureLoaded(ctx)) {
+                            val llm = LocalLLM.complete(
+                                system = "You are Sanya, a concise voice assistant. " +
+                                    "Use the background knowledge below to answer in 1-2 short sentences. " +
+                                    "No markdown. If the background doesn't help, answer from your own knowledge.\n\n$context",
+                                user = question, temp = 0.3f
+                            )
+                            if (!llm.isNullOrBlank()) {
+                                done(SanyaResponseEngine.answer(question, llm) ?: llm, false)
+                                return@execute
+                            }
+                        }
+                    }
+                }
+
+                // 6. Web
+                if (!webTried && net) {
+                    val a = web()
+                    if (a != null) { done(a); return@execute }
+                }
+
+                // 7. LLM alone: the last resort, so be honest that it may be wrong
+                if (LocalLLM.isInstalled(ctx)) {
+                    if (!LocalLLM.isReady) ui.post { quiet("Waking up my AI brain…") }
+                    if (LocalLLM.ensureLoaded(ctx)) {
+                        val llm = LocalLLM.answerQuestion(question)
+                        if (!llm.isNullOrBlank()) {
+                            done("I'm not certain, but $llm", false)
+                            return@execute
+                        }
+                    }
+                }
+
+                safeSay(
+                    if (net) "I couldn't find a reliable answer to that."
+                    else "I don't know that yet, and I'm offline right now."
+                )
 
             } catch (e: Throwable) {
                 ErrorLog.add(ctx, "Answering a question", e)
@@ -859,40 +917,94 @@ class StepRunner(
         }
     }
 
-    // PATCH 4: handleLLMTask — new function for translate, summarise, explain, write, correct
+    // ---------------------------------------------------------------
+    // LLM tasks: translate, summarise, explain, write, correct
+    // ---------------------------------------------------------------
+
+    // Google Translate is much better than a 360M model for Indian languages.
+    private val indianLangs = mapOf(
+        "tamil" to "ta", "hindi" to "hi", "telugu" to "te", "malayalam" to "ml",
+        "kannada" to "kn", "bengali" to "bn", "marathi" to "mr", "gujarati" to "gu"
+    )
+
+    private fun translateOnline(text: String, language: String): Boolean {
+        val code = indianLangs[language.trim().lowercase()] ?: return false
+        if (!online()) return false
+        val url = "https://translate.google.com/?sl=auto&tl=$code&text=" + Uri.encode(text) + "&op=translate"
+        ui.post { go(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+        safeSay("Opening Google Translate for ${language.trim()}, because my own model is weak in it.")
+        return true
+    }
+
     private fun handleLLMTask(raw: String) {
         knowledgeExecutor.execute {
             try {
                 val t = raw.lowercase().trim()
+
+                // ---- translation: Indian languages go to Google Translate when online ----
+                val tm = Regex("""translate (.+) to ([a-z ]+)""").find(t)
+                val src: String?
+                val lang: String?
+                if (tm != null) {
+                    src = tm.groupValues[1].trim(); lang = tm.groupValues[2].trim()
+                } else if (t.contains("translate this") || t.contains("translate that")) {
+                    src = lastKnowledgeAnswer
+                    lang = Regex("""to ([a-z]+)$""").find(t)?.groupValues?.get(1) ?: "tamil"
+                } else {
+                    src = null; lang = null
+                }
+
+                if (src != null && lang != null) {
+                    if (src.isBlank()) { safeSay("I have nothing to translate yet."); return@execute }
+                    if (translateOnline(src, lang)) return@execute
+                }
+
+                // ---- everything else needs the on-device model ----
+                if (!LocalLLM.isInstalled(ctx)) {
+                    safeSay("I need the AI brain for that. Download it from the start screen.")
+                    return@execute
+                }
+
+                if (!LocalLLM.isReady) ui.post { quiet("Waking up my AI brain…") }
+
+                if (!LocalLLM.ensureLoaded(ctx)) {
+                    safeSay("My AI brain couldn't start on this phone.")
+                    return@execute
+                }
+
                 val result: String? = when {
-                    Regex("""translate (.+) to ([a-z ]+)""").containsMatchIn(t) -> {
-                        val m = Regex("""translate (.+) to ([a-z ]+)""").find(t)!!
-                        LocalLLM.translate(m.groupValues[1].trim(), m.groupValues[2].trim())
-                    }
-                    t.contains("translate this") || t.contains("translate that") -> {
-                        val src = lastKnowledgeAnswer.ifBlank { "nothing to translate" }
-                        val lang = Regex("""to ([a-z]+)$""").find(t)?.groupValues?.get(1) ?: "Tamil"
-                        LocalLLM.translate(src, lang)
-                    }
+                    src != null && lang != null -> LocalLLM.translate(src, lang)
+
                     t.contains("summar") -> {
-                        val src = Regex("""summar(?:ise|ize) (.+)""").find(t)?.groupValues?.get(1) ?: lastKnowledgeAnswer
-                        LocalLLM.summarise(src.ifBlank { raw })
+                        val given = Regex("""summar(?:ise|ize) (.+)""").find(t)?.groupValues?.get(1)?.trim()
+                        val text =
+                            if (given == null || given in setOf("that", "this", "it", "the answer")) lastKnowledgeAnswer
+                            else given
+                        LocalLLM.summarise(text.ifBlank { raw })
                     }
+
                     t.contains("explain") -> {
                         val concept = t.removePrefix("explain").removePrefix("what is").trim()
                         LocalLLM.explain(concept.ifBlank { raw })
                     }
+
                     t.contains("correct") || t.contains("fix my grammar") || t.contains("fix this") -> {
-                        val src = Regex("""(?:correct|fix)\s+(?:this|that|my grammar[:]?\s*)(.*)""")
-                            .find(t)?.groupValues?.get(1)?.trim() ?: lastKnowledgeAnswer
-                        LocalLLM.correct(src.ifBlank { raw })
+                        val given = Regex("""(?:correct|fix)\s+(?:this|that|my grammar)(.*)""")
+                            .find(t)?.groupValues?.get(1)?.trim(' ', ':')
+                        val text = if (given.isNullOrBlank()) lastKnowledgeAnswer else given
+                        LocalLLM.correct(text.ifBlank { raw })
                     }
+
                     t.contains("write") || t.contains("tell me a story") || t.contains("poem") -> LocalLLM.create(raw)
+
                     t.contains("difference between") -> LocalLLM.explain(raw)
+
                     else -> LocalLLM.ask(raw)
                 }
+
                 if (!result.isNullOrBlank()) { rememberKnowledge(raw, result); safeSay(result) }
                 else safeSay("I couldn't work that out right now.")
+
             } catch (e: Throwable) {
                 ErrorLog.add(ctx, "LLM task", e); safeSay("I couldn't do that right now.")
             }
@@ -1246,7 +1358,7 @@ object KnowledgeStore {
     private fun importantTokens(question: String): Set<String> {
         val stopWords = setOf("what","what's","whats","is","are","was","were","who","whom","when","where","why","how","can","could","would","will","should","shall","do","does","did","has","have","had","the","a","an","of","to","for","me","please","tell","about","you","know","give")
         return question.lowercase(Locale.getDefault()).split(Regex("\\s+"))
-            .map { it.trim(' ','.', ',','?','!',':',';','"','\'').replace(Regex("['']s$"), "") }
+            .map { it.trim(' ','.', ',','?','!',':',';','"','\'').replace(Regex("['\u2019]s$"), "") }
             .filter { it.isNotEmpty() && it !in stopWords }.toSet()
     }
 }
