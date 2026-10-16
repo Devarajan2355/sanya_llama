@@ -2,23 +2,25 @@
 """
 build_knowledge_db.py
 ~~~~~~~~~~~~~~~~~~~~~
-Builds sanya-wiki-v1.db — the offline knowledge base used by OfflineKnowledge.kt.
+Builds sanya-wiki-v1.db, the offline knowledge base used by OfflineKnowledge.kt.
 
-Source: Simple English Wikipedia dump (~200 MB XML, expands to ~700 MB)
-Output: sanya-wiki-v1.db (~100 MB SQLite with FTS5 index)
+Source: Simple English Wikipedia dump (~200 MB XML)
+Output: sanya-wiki-v1.db (aim: 50-80 MB SQLite with an FTS4 index)
+
+Why FTS4 and not FTS5: Android's built-in SQLite is not guaranteed to include FTS5,
+but FTS4 is always there.
 
 Requirements:
     pip install mwxml mwparserfromhell tqdm
 
 Usage:
-    # 1. Download the dump (run once — ~220 MB)
     curl -L -o simplewiki.xml.bz2 \
       https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2
 
-    # 2. Build the database (takes ~5 minutes)
     python3 build_knowledge_db.py simplewiki.xml.bz2 sanya-wiki-v1.db
 
-    # 3. Host sanya-wiki-v1.db on your CDN and update DB_URL in OfflineKnowledge.kt
+Then upload sanya-wiki-v1.db as an asset of a GitHub Release and put the asset URL in
+DB_URL inside OfflineKnowledge.kt.
 """
 
 import bz2
@@ -36,16 +38,16 @@ except ImportError:
 
 
 # -----------------------------------------------------------------------
-# Config
+# Config. These keep the whole 4-part download under about 500 MB.
 # -----------------------------------------------------------------------
 
-MAX_SUMMARY_CHARS = 600   # first ~3 sentences per article
-MAX_ARTICLES      = 250_000
-MIN_SUMMARY_CHARS = 80    # skip stubs shorter than this
+MAX_SUMMARY_CHARS = 300      # about the first two sentences
+MAX_ARTICLES      = 100_000
+MIN_SUMMARY_CHARS = 80       # skip stubs shorter than this
 
 SKIP_TITLE_PREFIXES = (
     "Wikipedia:", "Category:", "Template:", "Help:", "File:",
-    "Portal:", "Draft:", "User:", "Talk:", "Module:",
+    "Portal:", "Draft:", "User:", "Talk:", "Module:", "MediaWiki:",
 )
 
 
@@ -54,37 +56,36 @@ SKIP_TITLE_PREFIXES = (
 # -----------------------------------------------------------------------
 
 def extract_summary(wikitext: str) -> str:
-    """Return the first 1-3 clean sentences from a wikitext string."""
+    """Return the first clean sentences of an article, up to MAX_SUMMARY_CHARS."""
     try:
         parsed = mwparserfromhell.parse(wikitext)
-        text   = parsed.strip_code()
+        text = parsed.strip_code()
     except Exception:
         text = re.sub(r"\{\{[^}]*\}\}", "", wikitext)
         text = re.sub(r"\[\[([^|\]]*\|)?([^\]]*)\]\]", r"\2", text)
         text = re.sub(r"<[^>]+>", "", text)
 
-    # Collapse whitespace
+    # Drop leftover file/category links and tables, then collapse whitespace
+    text = re.sub(r"\[\[(?:File|Image|Category):[^\]]*\]\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\n{2,}", "\n", text).strip()
-    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
 
-    # Take sentences up to MAX_SUMMARY_CHARS
+    # Use the first paragraph only
+    text = text.split("\n", 1)[0].strip()
+
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    summary   = ""
+    summary = ""
     for s in sentences:
         s = s.strip()
         if not s:
             continue
-        if len(summary) + len(s) > MAX_SUMMARY_CHARS:
+        if summary and len(summary) + len(s) > MAX_SUMMARY_CHARS:
             break
         summary += (" " if summary else "") + s
+        if len(summary) >= MAX_SUMMARY_CHARS:
+            break
 
-    return summary.strip()
-
-
-def extract_categories(wikitext: str) -> str:
-    """Return pipe-separated category names."""
-    cats = re.findall(r"\[\[Category:([^\]|]+)", wikitext, re.IGNORECASE)
-    return "|".join(c.strip() for c in cats[:10])
+    return summary[:MAX_SUMMARY_CHARS + 120].strip()
 
 
 # -----------------------------------------------------------------------
@@ -93,15 +94,15 @@ def extract_categories(wikitext: str) -> str:
 
 def create_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA page_size=4096")
+    conn.execute("PRAGMA journal_mode=WAL")      # fast inserts; switched back at the end
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # FTS4 (works on every Android). Porter stemming so "invented" matches "invent".
     conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS articles USING fts5(
+        CREATE VIRTUAL TABLE IF NOT EXISTS articles USING fts4(
             title,
             summary,
-            categories,
-            tokenize = 'porter unicode61'
+            tokenize=porter
         )
     """)
     conn.execute("""
@@ -116,7 +117,7 @@ def create_db(path: str) -> sqlite3.Connection:
 
 def insert_batch(conn: sqlite3.Connection, rows: list) -> None:
     conn.executemany(
-        "INSERT INTO articles(title, summary, categories) VALUES (?, ?, ?)",
+        "INSERT INTO articles(title, summary) VALUES (?, ?)",
         rows
     )
     conn.commit()
@@ -130,10 +131,12 @@ def main(dump_path: str, db_path: str) -> None:
     print(f"Source: {dump_path}")
     print(f"Output: {db_path}")
 
-    if Path(db_path).exists():
-        Path(db_path).unlink()
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        p = Path(db_path + suffix)
+        if p.exists():
+            p.unlink()
 
-    conn  = create_db(db_path)
+    conn = create_db(db_path)
     batch = []
     total = 0
     skipped = 0
@@ -154,10 +157,10 @@ def main(dump_path: str, db_path: str) -> None:
 
             title = page.title or ""
 
-            if any(title.startswith(p) for p in SKIP_TITLE_PREFIXES):
+            if page.namespace != 0:      # 0 = main articles
                 continue
 
-            if page.namespace != 0:   # 0 = main articles
+            if any(title.startswith(p) for p in SKIP_TITLE_PREFIXES):
                 continue
 
             rev = next(iter(page), None)
@@ -165,14 +168,19 @@ def main(dump_path: str, db_path: str) -> None:
                 skipped += 1
                 continue
 
-            summary    = extract_summary(rev.text)
-            categories = extract_categories(rev.text)
+            # Skip redirects and disambiguation pages
+            head = rev.text[:200].lstrip().lower()
+            if head.startswith("#redirect") or "{{disambig" in rev.text[:2000].lower():
+                skipped += 1
+                continue
+
+            summary = extract_summary(rev.text)
 
             if len(summary) < MIN_SUMMARY_CHARS:
                 skipped += 1
                 continue
 
-            batch.append((title, summary, categories))
+            batch.append((title, summary))
             total += 1
 
             if bar:
@@ -192,20 +200,32 @@ def main(dump_path: str, db_path: str) -> None:
     # ---- metadata ----
     conn.execute("INSERT OR REPLACE INTO meta VALUES ('article_count', ?)", (str(total),))
     conn.execute("INSERT OR REPLACE INTO meta VALUES ('source', 'Simple English Wikipedia')")
-    conn.execute("INSERT OR REPLACE INTO meta VALUES ('build_version', '1')")
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('build_version', '2-fts4')")
     conn.commit()
 
     # ---- optimise ----
-    print("Optimising FTS index…")
+    print("Optimising FTS index...")
     conn.execute("INSERT INTO articles(articles) VALUES('optimize')")
+    conn.commit()
+
+    # The app opens the file read-only, which does not work with a WAL database.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("VACUUM")
     conn.commit()
     conn.close()
 
+    for suffix in ("-wal", "-shm"):
+        p = Path(db_path + suffix)
+        if p.exists():
+            p.unlink()
+
     size_mb = Path(db_path).stat().st_size / 1_048_576
     print(f"\nDone. {total:,} articles, {skipped:,} skipped.")
-    print(f"Database size: {size_mb:.1f} MB → {db_path}")
-    print("\nNext step: host the .db file and update DB_URL in OfflineKnowledge.kt")
+    print(f"Database size: {size_mb:.1f} MB -> {db_path}")
+    if size_mb > 90:
+        print("Warning: bigger than 90 MB. Lower MAX_ARTICLES or MAX_SUMMARY_CHARS to stay inside 500 MB.")
+    print("\nNext step: upload the .db file to a GitHub Release and set DB_URL in OfflineKnowledge.kt")
 
 
 if __name__ == "__main__":
