@@ -1,0 +1,21 @@
+# Cloned by the CI workflow (and by you locally if you build on your PC). Never commit it.
+app/src/main/cpp/llama.cpp/
+
+# Gradle and build output (these made the project look huge)
+.gradle/
+build/
+app/build/
+.idea/
+*.iml
+local.properties
+captures/
+.cxx/
+.externalNativeBuild/
+
+# Generated from sanya.keystore.b64 by the CI
+app/sanya.keystore
+
+# Large generated data
+*.db
+*.gguf
+*.bz2
