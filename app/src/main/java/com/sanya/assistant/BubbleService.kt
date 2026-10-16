@@ -85,6 +85,9 @@ class BubbleService : Service() {
         const val IDLE = 0xFF6C5CE7.toInt()
         const val LISTENING = 0xFF00B894.toInt()
         const val HANDS_FREE = 0xFFE17055.toInt()
+
+        /** True while the service is running. Pomodoro uses it to decide whether to speak a cue. */
+        @Volatile var alive = false
     }
 
     override fun onBind(i: Intent?): IBinder? = null
@@ -102,6 +105,7 @@ class BubbleService : Service() {
         getSystemService(NotificationManager::class.java)
             .createNotificationChannel(NotificationChannel("sanya", "Sanya", NotificationManager.IMPORTANCE_MIN))
         startForeground(1, notif())
+        alive = true
 
         // ---- Android TTS (fallback when Piper is not ready) ----
         tts = TextToSpeech(this) {
@@ -139,17 +143,19 @@ class BubbleService : Service() {
             }
         }.also { it.isDaemon = true }.start()
 
-        // ---- Boot LocalLLM and OfflineKnowledge in the background ----
+        // ---- Open the knowledge base (small). The LLM is NOT loaded here: it loads on first use
+        //      and is freed after 5 idle minutes, so it does not eat RAM all day. ----
+        openKnowledgeInBackground()
+
+        ui.postDelayed(tick, 45_000L)
+    }
+
+    private fun openKnowledgeInBackground() {
         Thread {
-            if (LocalLLM.isInstalled(this) && !LocalLLM.isReady) {
-                LocalLLM.load(this)
-            }
             if (OfflineKnowledge.isInstalled(this) && !OfflineKnowledge.isOpen) {
                 OfflineKnowledge.open(this)
             }
         }.also { it.isDaemon = true }.start()
-
-        ui.postDelayed(tick, 45_000L)
     }
 
     // ---------- Proactive Sanya ----------
@@ -157,6 +163,7 @@ class BubbleService : Service() {
         override fun run() {
             try { proactiveCheck() } catch (e: Throwable) { ErrorLog.add(this@BubbleService, "Proactive check", e) }
             try { keepWidgetFresh() } catch (e: Throwable) { ErrorLog.add(this@BubbleService, "Widget refresh", e) }
+            try { LocalLLM.unloadIfIdle(5) } catch (e: Throwable) { ErrorLog.add(this@BubbleService, "LLM unload", e) }
             ui.postDelayed(this, 60_000L)
         }
     }
@@ -195,25 +202,26 @@ class BubbleService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(1, notif())
+
+        // A spoken cue sent by Pomodoro (see Pomodoro.cue). Speak it and do nothing else.
+        val cue = intent?.getStringExtra("say")
+        if (!cue.isNullOrBlank()) {
+            say(cue)
+            return START_STICKY
+        }
+
         loadEars()
         applyHearing()
 
-        // Retry Piper init if just downloaded
+        // Retry Piper init if it was just downloaded
         if (!NaturalVoice.isReady && NaturalVoice.isInstalled(this)) {
             Thread {
                 NaturalVoice.init(this)
             }.also { it.isDaemon = true }.start()
         }
 
-        // Retry LLM load if just downloaded
-        Thread {
-            if (LocalLLM.isInstalled(this) && !LocalLLM.isReady) {
-                LocalLLM.load(this)
-            }
-            if (OfflineKnowledge.isInstalled(this) && !OfflineKnowledge.isOpen) {
-                OfflineKnowledge.open(this)
-            }
-        }.also { it.isDaemon = true }.start()
+        // Retry opening the knowledge base if it was just downloaded
+        openKnowledgeInBackground()
 
         return START_STICKY
     }
@@ -356,7 +364,7 @@ class BubbleService : Service() {
     // ---------- Speaking ----------
     /**
      * Speak [s] using Piper TTS when ready, falling back to Android TTS.
-     * Piper runs on its own thread and signals completion via pending counter.
+     * Piper runs on its own thread and signals completion via the pending counter.
      */
     private fun say(s: String) {
         show(s)
@@ -366,7 +374,7 @@ class BubbleService : Service() {
         pending++
 
         if (NaturalVoice.isReady) {
-            // Piper TTS — non-blocking, plays on its own thread
+            // Piper TTS: non-blocking, plays on its own thread
             Thread {
                 NaturalVoice.speak(s)
                 ui.post {
@@ -553,6 +561,7 @@ class BubbleService : Service() {
     }
 
     override fun onDestroy() {
+        alive = false
         Learner.flush(this)
         ui.removeCallbacksAndMessages(null)
         unmuteBeep()
@@ -565,9 +574,9 @@ class BubbleService : Service() {
         // ---- Piper TTS ----
         NaturalVoice.stop()
         NaturalVoice.release()
-        // ---- LLM and knowledge base ----
-        LocalLLM.unload()
+        // ---- Knowledge base, and the LLM (freeing it can wait for an answer to finish, so do it off the main thread) ----
         OfflineKnowledge.close()
+        Thread { LocalLLM.unload() }.start()
         val e = ears
         ears = null
         e?.stop()
