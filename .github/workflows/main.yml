@@ -1,5 +1,12 @@
 name: Build APK
 on: [push, workflow_dispatch]
+
+env:
+  # llama.cpp's API changes often. After one green build, copy the commit hash that the
+  # "Get llama.cpp" step prints into this line, so later builds always use that version.
+  # Leave it empty to build against the latest master.
+  LLAMA_CPP_SHA: ""
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -8,12 +15,22 @@ jobs:
 
       - name: Get llama.cpp
         run: |
-          if [ ! -f app/src/main/cpp/llama.cpp/CMakeLists.txt ]; then
-            rm -rf app/src/main/cpp/llama.cpp
-            git clone --depth 1 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
+          D=app/src/main/cpp/llama.cpp
+          if [ ! -f "$D/CMakeLists.txt" ]; then
+            rm -rf "$D"
+            mkdir -p "$D"
+            if [ -n "$LLAMA_CPP_SHA" ]; then
+              git -C "$D" init -q
+              git -C "$D" remote add origin https://github.com/ggml-org/llama.cpp
+              git -C "$D" fetch --depth 1 origin "$LLAMA_CPP_SHA"
+              git -C "$D" checkout -q FETCH_HEAD
+            else
+              git clone --depth 1 https://github.com/ggml-org/llama.cpp "$D"
+            fi
           fi
-          git -C app/src/main/cpp/llama.cpp log -1 --format=%H 2>/dev/null || true
-          grep -n -A5 "llama_sampler_init_penalties" app/src/main/cpp/llama.cpp/include/llama.h || true
+          echo "llama.cpp commit:"
+          git -C "$D" log -1 --format=%H 2>/dev/null || true
+          grep -n -A5 "llama_sampler_init_penalties" "$D/include/llama.h" || true
 
       - uses: actions/setup-java@v5
         with:
