@@ -42,16 +42,18 @@
         <activity android:name=".TimeActivity" android:exported="false"/>
         <service android:name=".BubbleService" android:exported="false"
             android:foregroundServiceType="microphone"/>
-        <receiver android:name=".BootReceiver" android:exported="true">
+        <!-- exported=false: the system still delivers BOOT_COMPLETED, other apps cannot trigger these. -->
+        <receiver android:name=".BootReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
             </intent-filter>
         </receiver>
-        <receiver android:name=".PomodoroReceiver" android:exported="true">
+        <receiver android:name=".PomodoroReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
             </intent-filter>
         </receiver>
+        <!-- The widget must stay exported so the home screen can talk to it. -->
         <receiver android:name=".SanyaWidget" android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
